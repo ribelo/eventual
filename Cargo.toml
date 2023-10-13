@@ -1,0 +1,19 @@
+[package]
+name = "eventual"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# minions-derive = { path = "../minions-derive" }
+ahash = "0.8"
+async-trait = "0.1"
+hashbrown = "0.14"
+strum = { version = "0.25", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.32", features = ["full"] }
+tracing = "0.1"
+typed-builder = "0.16"
+chrono = "0.4.31"
+parking_lot = "0.12.1"
+dashmap = "5.5.3"
+smallvec = "1.11.1"
