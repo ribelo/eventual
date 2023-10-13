@@ -17,3 +17,10 @@ chrono = "0.4.31"
 parking_lot = "0.12.1"
 dashmap = "5.5.3"
 smallvec = "1.11.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "eventual_bench"
+harness = false

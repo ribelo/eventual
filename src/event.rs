@@ -1,20 +1,15 @@
 use async_trait::async_trait;
 
-use crate::{
-    effect::{Effect, Effects},
-    eve::Eve,
-};
+use crate::effect::{Effect, Effects};
 
 #[async_trait]
-pub trait Event: Send + Sync + 'static {
-    type Eve: Eve;
-
-    fn to_effect(self) -> Effect<Self::Eve>
+pub trait Event<T>: Send + Sync + 'static {
+    fn to_effect(self) -> Effect<T>
     where
         Self: Sized + 'static,
     {
         Effect::Event(Box::new(self))
     }
 
-    async fn handle(&self, state: &<Self::Eve as Eve>::State) -> Effects<Self::Eve>;
+    async fn handle(&self, state: &T) -> Effects<T>;
 }
