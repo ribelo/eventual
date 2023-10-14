@@ -1,11 +1,6 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use pollster::FutureExt;
-use tokio::{
-    sync::{mpsc, RwLock},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::event::{self, Action, Event, Query, Transaction};
 
@@ -14,10 +9,10 @@ pub struct Eve<T> {
     router: Router<T>,
 }
 
-impl<T: Send + Sync + 'static> Eve<T> {
+impl<T: Send + Sync + Clone + 'static> Eve<T> {
     pub fn new(global_state: T) -> Self {
         let (action_handler, query_handler, transaction_handler, router) =
-            create_eve_handlers(Arc::new(RwLock::new(global_state)));
+            create_eve_handlers(global_state);
         tokio::spawn(run_action_handler_loop(action_handler));
         tokio::spawn(run_query_handler_loop(query_handler));
         tokio::spawn(run_transaction_handler_loop(transaction_handler));
@@ -29,14 +24,14 @@ impl<T: Send + Sync + 'static> Eve<T> {
 }
 
 pub struct EveActionHandler<T> {
-    pub global_state: Arc<RwLock<T>>,
+    pub global_state: T,
     pub action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
     pub router: Router<T>,
 }
 
 impl<T> EveActionHandler<T> {
     pub fn new(
-        global_state: Arc<RwLock<T>>,
+        global_state: T,
         action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
         router: Router<T>,
     ) -> Self {
@@ -49,14 +44,14 @@ impl<T> EveActionHandler<T> {
 }
 
 pub struct EveQueryHandler<T> {
-    pub global_state: Arc<RwLock<T>>,
+    pub global_state: T,
     pub query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
     pub router: Router<T>,
 }
 
 impl<T> EveQueryHandler<T> {
     pub fn new(
-        global_state: Arc<RwLock<T>>,
+        global_state: T,
         query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
         router: Router<T>,
     ) -> Self {
@@ -69,14 +64,14 @@ impl<T> EveQueryHandler<T> {
 }
 
 pub struct EveTransactionHandler<T> {
-    pub global_state: Arc<RwLock<T>>,
+    pub global_state: T,
     pub transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
     pub router: Router<T>,
 }
 
 impl<T> EveTransactionHandler<T> {
     pub fn new(
-        global_state: Arc<RwLock<T>>,
+        global_state: T,
         transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
         router: Router<T>,
     ) -> Self {
@@ -104,8 +99,8 @@ impl<T> Clone for Router<T> {
     }
 }
 
-pub fn create_eve_handlers<T: Send + Sync + 'static>(
-    global_state: Arc<RwLock<T>>,
+pub fn create_eve_handlers<T: Send + Sync + Clone + 'static>(
+    global_state: T,
 ) -> (
     EveActionHandler<T>,
     EveQueryHandler<T>,
@@ -187,110 +182,119 @@ impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
     }
 }
 
-pub async fn run_action_handler_loop<T: Send + Sync + 'static>(
+pub async fn run_action_handler_loop<T: Send + Sync + Clone + 'static>(
     mut handler: EveActionHandler<T>,
 ) -> JoinHandle<()> {
     let state = handler.global_state.clone();
     loop {
         let event = handler.next_event().await;
-        let state_clone = state.clone();
         let router_clone = handler.router.clone();
         match event.execution_type() {
             event::ExecutionType::Sequential => {
-                let events = event.handle(&*state_clone.read().await).await;
+                let events = event.handle(&state).await;
                 for event in events.effects {
                     router_clone.relay(event).await;
                 }
             }
             event::ExecutionType::Concurrent => {
+                let state_clone = state.clone();
                 tokio::spawn(async move {
-                    let events = event.handle(&*state_clone.read().await).await;
+                    let events = event.handle(&state_clone).await;
                     for event in events.effects {
                         router_clone.relay(event).await;
                     }
                 });
             }
-            event::ExecutionType::Parallel => rayon::spawn(move || {
-                async move {
-                    let events = event.handle(&*state_clone.read().await).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
+            event::ExecutionType::Parallel => {
+                let state_clone = state.clone();
+                rayon::spawn(move || {
+                    async move {
+                        let events = event.handle(&state_clone).await;
+                        for event in events.effects {
+                            router_clone.relay(event).await;
+                        }
                     }
-                }
-                .block_on()
-            }),
+                    .block_on()
+                })
+            }
         }
     }
 }
 
-pub async fn run_query_handler_loop<T: Send + Sync + 'static>(
+pub async fn run_query_handler_loop<T: Send + Sync + Clone + 'static>(
     mut handler: EveQueryHandler<T>,
 ) -> JoinHandle<()> {
     let state = handler.global_state.clone();
     loop {
         let event = handler.next_event().await;
-        let state_clone = state.clone();
         let router_clone = handler.router.clone();
         match event.execution_type() {
             event::ExecutionType::Sequential => {
-                let events = event.handle(&*state_clone.read().await).await;
+                let events = event.handle(&state).await;
                 for event in events.effects {
                     router_clone.relay(event).await;
                 }
             }
             event::ExecutionType::Concurrent => {
+                let state_clone = state.clone();
                 tokio::spawn(async move {
-                    let events = event.handle(&*state_clone.read().await).await;
+                    let events = event.handle(&state_clone).await;
                     for event in events.effects {
                         router_clone.relay(event).await;
                     }
                 });
             }
-            event::ExecutionType::Parallel => rayon::spawn(move || {
-                async move {
-                    let events = event.handle(&*state_clone.read().await).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
+            event::ExecutionType::Parallel => {
+                let state_clone = state.clone();
+                rayon::spawn(move || {
+                    async move {
+                        let events = event.handle(&state_clone).await;
+                        for event in events.effects {
+                            router_clone.relay(event).await;
+                        }
                     }
-                }
-                .block_on()
-            }),
+                    .block_on()
+                })
+            }
         }
     }
 }
 
-pub async fn run_transaction_handler_loop<T: Send + Sync + 'static>(
+pub async fn run_transaction_handler_loop<T: Send + Sync + Clone + 'static>(
     mut handler: EveTransactionHandler<T>,
 ) -> JoinHandle<()> {
-    let state = handler.global_state.clone();
+    let mut state = handler.global_state.clone();
     loop {
         let event = handler.next_event().await;
-        let state_clone = state.clone();
         let router_clone = handler.router.clone();
         match event.execution_type() {
             event::ExecutionType::Sequential => {
-                let events = event.handle(&mut *state_clone.write().await).await;
+                let events = event.handle(&mut state).await;
                 for event in events.effects {
                     router_clone.relay(event).await;
                 }
             }
             event::ExecutionType::Concurrent => {
+                let mut state_clone = state.clone();
                 tokio::spawn(async move {
-                    let events = event.handle(&mut *state_clone.write().await).await;
+                    let events = event.handle(&mut state_clone).await;
                     for event in events.effects {
                         router_clone.relay(event).await;
                     }
                 });
             }
-            event::ExecutionType::Parallel => rayon::spawn(move || {
-                async move {
-                    let events = event.handle(&mut *state_clone.write().await).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
+            event::ExecutionType::Parallel => {
+                let mut state_clone = state.clone();
+                rayon::spawn(move || {
+                    async move {
+                        let events = event.handle(&mut state_clone).await;
+                        for event in events.effects {
+                            router_clone.relay(event).await;
+                        }
                     }
-                }
-                .block_on()
-            }),
+                    .block_on()
+                })
+            }
         }
     }
 }
@@ -307,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn it_works() {
-        #[derive(Debug, Default)]
+        #[derive(Debug, Default, Clone)]
         struct GlobalState {
             a: i32,
         }

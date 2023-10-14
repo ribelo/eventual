@@ -5,7 +5,7 @@ use eventual::{
     event::{Action, Event, Events, Transaction},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GlobalState {
     count: i32,
 }
