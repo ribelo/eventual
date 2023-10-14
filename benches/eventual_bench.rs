@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
-use eventual::{effect::Effects, eve::create_eve_handlers, event::Event, side_effect::SideEffect};
+use eventual::{
+    effect::{Event, Events, Transaction},
+    eve::Eve,
+};
 
 #[derive(Debug, Default)]
 struct GlobalState {
@@ -9,11 +12,17 @@ struct GlobalState {
 
 struct Ping;
 
+impl From<Ping> for Event<GlobalState> {
+    fn from(event: Ping) -> Self {
+        Event::Transaction(Box::new(event))
+    }
+}
+
 #[async_trait]
-impl SideEffect<GlobalState> for Ping {
-    async fn handle(&self, state: &mut GlobalState) -> Effects<GlobalState> {
+impl Transaction<GlobalState> for Ping {
+    fn handle(&self, state: &mut GlobalState) -> Option<Events<GlobalState>> {
         state.count += 1;
-        Effects::none()
+        None
     }
 }
 
@@ -22,14 +31,9 @@ fn benchmarks(c: &mut Criterion) {
     c.bench_function("eve send ping 1e5", |b| {
         b.iter(|| {
             runtime.block_on(async {
-                let (eve_event_handler, eve_side_effect_handler) =
-                    create_eve_handlers(GlobalState::default());
-                // let event_tx = eve_event_handler.event_tx.clone();
-                let side_effect_tx = eve_event_handler.side_effext_tx.clone();
-                eve_event_handler.spawn_loop().await;
-                eve_side_effect_handler.spawn_loop().await;
+                let eve = Eve::new(GlobalState::default());
                 for _ in 0..100_000 {
-                    side_effect_tx.send(Box::new(Ping)).await.unwrap();
+                    eve.dispatch(Ping).await;
                 }
             })
         })

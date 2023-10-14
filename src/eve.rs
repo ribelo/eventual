@@ -1,115 +1,220 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
 };
 
-use crate::{
-    effect::{Effect, Effects},
-    event::Event,
-    side_effect::{self, SideEffect},
-};
+use crate::effect::{Action, Event, Events, Query, Transaction};
 
-pub struct EveEventHandler<T> {
-    pub event_tx: mpsc::Sender<Box<dyn Event<T>>>,
-    pub event_rx: mpsc::Receiver<Box<dyn Event<T>>>,
-    pub side_effext_tx: mpsc::Sender<Box<dyn SideEffect<T>>>,
-    pub global_state: Arc<RwLock<T>>,
+#[derive(Clone)]
+pub struct Eve<T> {
+    router: Router<T>,
 }
 
-pub struct EveSideEffectHandler<T> {
-    pub event_tx: mpsc::Sender<Box<dyn Event<T>>>,
-    pub side_effext_tx: mpsc::Sender<Box<dyn SideEffect<T>>>,
-    pub side_effext_rx: mpsc::Receiver<Box<dyn SideEffect<T>>>,
-    pub global_state: Arc<RwLock<T>>,
+impl<T: Send + Sync + 'static> Eve<T> {
+    pub fn new(global_state: T) -> Self {
+        let (action_handler, query_handler, transaction_handler, router) =
+            create_eve_handlers(Arc::new(RwLock::new(global_state)));
+        tokio::spawn(run_handler_loop(action_handler));
+        tokio::spawn(run_handler_loop(query_handler));
+        tokio::spawn(run_handler_loop(transaction_handler));
+        Self { router }
+    }
+    pub async fn dispatch(&self, event: impl Into<Event<T>>) {
+        self.router.relay(event.into()).await;
+    }
 }
 
-impl<T> EveEventHandler<T>
-where
-    T: Send + Sync + 'static,
-{
-    async fn next_event(&mut self) -> Box<dyn Event<T>> {
-        self.event_rx.recv().await.expect("Event channel closed")
-    }
+pub struct EveActionHandler<T> {
+    pub global_state: Arc<RwLock<T>>,
+    pub action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
+    pub router: Router<T>,
+}
 
-    async fn handle_event(&self, event: Box<dyn Event<T>>) -> Effects<T> {
-        event.handle(&*self.global_state.clone().read().await).await
+impl<T> EveActionHandler<T> {
+    pub fn new(
+        global_state: Arc<RwLock<T>>,
+        action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
+        router: Router<T>,
+    ) -> Self {
+        Self {
+            global_state,
+            action_rx,
+            router,
+        }
     }
+}
 
-    async fn handle_effect(&self, effect: Effect<T>) {
-        match effect {
-            crate::effect::Effect::Event(event) => {
-                self.event_tx
+pub struct EveQueryHandler<T> {
+    pub global_state: Arc<RwLock<T>>,
+    pub query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
+    pub router: Router<T>,
+}
+
+impl<T> EveQueryHandler<T> {
+    pub fn new(
+        global_state: Arc<RwLock<T>>,
+        query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
+        router: Router<T>,
+    ) -> Self {
+        Self {
+            global_state,
+            query_rx,
+            router,
+        }
+    }
+}
+
+pub struct EveTransactionHandler<T> {
+    pub global_state: Arc<RwLock<T>>,
+    pub transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
+    pub router: Router<T>,
+}
+
+impl<T> EveTransactionHandler<T> {
+    pub fn new(
+        global_state: Arc<RwLock<T>>,
+        transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
+        router: Router<T>,
+    ) -> Self {
+        Self {
+            global_state,
+            transaction_rx,
+            router,
+        }
+    }
+}
+
+pub struct Router<T> {
+    pub action_tx: mpsc::Sender<Box<dyn Action<T>>>,
+    pub query_tx: mpsc::Sender<Box<dyn Query<T>>>,
+    pub transaction_tx: mpsc::Sender<Box<dyn Transaction<T>>>,
+}
+
+impl<T> Clone for Router<T> {
+    fn clone(&self) -> Self {
+        Self {
+            action_tx: self.action_tx.clone(),
+            query_tx: self.query_tx.clone(),
+            transaction_tx: self.transaction_tx.clone(),
+        }
+    }
+}
+
+pub fn create_eve_handlers<T: Send + Sync + 'static>(
+    global_state: Arc<RwLock<T>>,
+) -> (
+    EveActionHandler<T>,
+    EveQueryHandler<T>,
+    EveTransactionHandler<T>,
+    Router<T>,
+) {
+    let (action_tx, action_rx) = mpsc::channel(100);
+    let (query_tx, query_rx) = mpsc::channel(100);
+    let (transaction_tx, transaction_rx) = mpsc::channel(100);
+    let router = Router {
+        action_tx,
+        query_tx,
+        transaction_tx,
+    };
+    (
+        EveActionHandler::new(global_state.clone(), action_rx, router.clone()),
+        EveQueryHandler::new(global_state.clone(), query_rx, router.clone()),
+        EveTransactionHandler::new(global_state, transaction_rx, router.clone()),
+        router,
+    )
+}
+
+impl<T> Router<T> {
+    pub async fn relay(&self, event: Event<T>) {
+        match event {
+            Event::Action(event) => {
+                self.action_tx
                     .send(event)
                     .await
-                    .expect("Event channel closed");
+                    .expect("Action channel closed");
             }
-            crate::effect::Effect::SideEffects(side_effect) => {
-                self.side_effext_tx
-                    .send(side_effect)
+            Event::Query(event) => {
+                self.query_tx
+                    .send(event)
                     .await
-                    .expect("Side effect channel closed");
+                    .expect("Query channel closed");
+            }
+            Event::Transaction(event) => {
+                self.transaction_tx
+                    .send(event)
+                    .await
+                    .expect("Transaction channel closed");
             }
         }
     }
+}
 
-    pub async fn spawn_loop(mut self) {
-        tokio::spawn(async move {
-            loop {
-                let event = self.next_event().await;
-                let effects = self.handle_event(event).await;
-                for effect in effects.effects {
-                    self.handle_effect(effect).await;
-                }
-            }
-        });
+#[async_trait]
+pub trait Handler<T: Send + Sync + 'static> {
+    type EventType: Send + Sync;
+
+    async fn next_event(&mut self) -> Self::EventType;
+    async fn handle(&self, event: Self::EventType);
+}
+
+pub async fn run_handler_loop<T, H>(mut handler: H) -> JoinHandle<()>
+where
+    T: 'static + Send + Sync,
+    H: Handler<T> + Send + 'static,
+{
+    loop {
+        let event = handler.next_event().await;
+        handler.handle(event).await;
     }
 }
 
-impl<T> EveSideEffectHandler<T>
-where
-    T: Send + Sync + 'static,
-{
-    async fn next_side_effect(&mut self) -> Box<dyn SideEffect<T>> {
-        self.side_effext_rx
+#[async_trait]
+impl<T: 'static + Send + Sync> Handler<T> for EveActionHandler<T> {
+    type EventType = Box<dyn Action<T>>;
+    async fn next_event(&mut self) -> Self::EventType {
+        self.action_rx.recv().await.expect("Action channel closed")
+    }
+
+    async fn handle(self, event: Self::EventType) {
+        tokio::spawn(async move {
+            event.handle(&*self.global_state.clone().read().await).await;
+        });
+        // event
+        //     .execute(&*self.global_state.clone().read().await, &self.router)
+        //     .await;
+    }
+}
+
+#[async_trait]
+impl<T: 'static + Send + Sync> Handler<T> for EveQueryHandler<T> {
+    type EventType = Box<dyn Query<T>>;
+    async fn next_event(&mut self) -> Self::EventType {
+        self.query_rx.recv().await.expect("Query channel closed")
+    }
+    async fn handle(&self, event: Self::EventType) {
+        event
+            .execute(&*self.global_state.clone().read().await, &self.router)
+            .await;
+    }
+}
+
+#[async_trait]
+impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
+    type EventType = Box<dyn Transaction<T>>;
+    async fn next_event(&mut self) -> Self::EventType {
+        self.transaction_rx
             .recv()
             .await
-            .expect("Side effects channel closed")
+            .expect("Transaction channel closed")
     }
-
-    async fn handle_side_effect(&self, side_effect: Box<dyn SideEffect<T>>) -> Effects<T> {
-        side_effect
-            .handle(&mut *self.global_state.clone().write().await)
-            .await
+    async fn handle(&self, event: Self::EventType) {
+        event
+            .execute(&mut *self.global_state.clone().write().await, &self.router)
+            .await;
     }
-    pub async fn spawn_loop(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                let side_effect = self.next_side_effect().await;
-                self.handle_side_effect(side_effect).await;
-            }
-        })
-    }
-}
-
-pub fn create_eve_handlers<T>(state: T) -> (EveEventHandler<T>, EveSideEffectHandler<T>) {
-    let global_state = Arc::new(RwLock::new(state));
-    let (event_tx, event_rx) = mpsc::channel(1024);
-    let (side_effext_tx, side_effext_rx) = mpsc::channel(1024);
-    let eve_event_handler = EveEventHandler {
-        event_tx: event_tx.clone(),
-        event_rx,
-        side_effext_tx: side_effext_tx.clone(),
-        global_state: global_state.clone(),
-    };
-    let eve_side_effect_handler = EveSideEffectHandler {
-        event_tx,
-        side_effext_tx,
-        side_effext_rx,
-        global_state,
-    };
-    (eve_event_handler, eve_side_effect_handler)
 }
 
 #[allow(dead_code)]
@@ -129,29 +234,31 @@ mod tests {
 
         struct TestEvent {}
 
-        #[async_trait]
-        impl Event<GlobalState> for TestEvent {
-            async fn handle(&self, state: &GlobalState) -> Effects<GlobalState> {
-                println!("TestEvent::handle {:?}", state);
-                Effects::new().add_side_effect(TestEvent {})
+        impl From<TestEvent> for Event<GlobalState> {
+            fn from(event: TestEvent) -> Self {
+                Event::Action(Box::new(event))
             }
         }
 
         #[async_trait]
-        impl SideEffect<GlobalState> for TestEvent {
-            async fn handle(&self, state: &mut GlobalState) -> Effects<GlobalState> {
-                state.a += 1;
+        impl Action<GlobalState> for TestEvent {
+            async fn handle(&self, state: &GlobalState) -> Option<Events<GlobalState>> {
                 println!("TestEvent::handle {:?}", state);
-                Effects::new().add_event(TestEvent {})
+                Some(Events::new().push(TestEvent {}))
             }
         }
 
-        let (eve_event_handler, eve_side_effect_handler) =
-            create_eve_handlers(GlobalState::default());
-        let event_tx = eve_event_handler.event_tx.clone();
-        eve_event_handler.spawn_loop().await;
-        eve_side_effect_handler.spawn_loop().await;
-        event_tx.send(Box::new(TestEvent {})).await.unwrap();
+        // #[async_trait]
+        // impl Transaction<GlobalState> for TestEvent {
+        //     async fn handle(&self, state: &mut GlobalState) -> Events<GlobalState> {
+        //         state.a += 1;
+        //         println!("TestEvent::handle {:?}", state);
+        //         Events::new().add_action(TestEvent {})
+        //     }
+        // }
+
+        let eve = Eve::new(GlobalState::default());
+        eve.dispatch(TestEvent {}).await;
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }

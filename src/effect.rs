@@ -1,21 +1,63 @@
-use crate::{event::Event, side_effect::SideEffect};
+use async_trait::async_trait;
 
-pub enum Effect<T> {
-    Event(Box<dyn Event<T>>),
-    SideEffects(Box<dyn SideEffect<T>>),
+use crate::eve::{Handler, Router};
+
+pub enum Event<T> {
+    Action(Box<dyn Action<T>>),
+    Query(Box<dyn Query<T>>),
+    Transaction(Box<dyn Transaction<T>>),
 }
 
-pub struct Effects<T> {
-    pub(crate) effects: Vec<Effect<T>>,
+pub struct Events<T> {
+    pub(crate) effects: Vec<Event<T>>,
 }
 
-impl<T> Default for Effects<T> {
+#[async_trait]
+pub trait Action<T: Send + Sync>: Send + Sync + 'static {
+    async fn execute(&self, state: &T, router: &Router<T>) {
+        if let Some(events) = self.handle(state).await {
+            for event in events.effects {
+                router.relay(event).await;
+            }
+        }
+    }
+    async fn handle(&self, state: &T) -> Option<Events<T>>;
+}
+
+#[async_trait]
+pub trait Query<T: Send + Sync + 'static>: Send + Sync + 'static {
+    async fn execute(&self, state: &T, router: &Router<T>) {
+        if let Some(events) = self.handle(state).await {
+            for event in events.effects {
+                router.relay(event).await;
+            }
+        }
+    }
+    async fn handle(&self, state: &T) -> Option<Events<T>>;
+}
+
+#[async_trait]
+pub trait Transaction<T: Send + Sync + 'static>: Send + Sync + 'static {
+    async fn route(&self, event: Event<T>, state: &T, router: Router<T>) {
+        router.relay(event).await;
+    }
+    async fn execute(&self, state: &mut T, router: &Router<T>) {
+        if let Some(events) = self.handle(state) {
+            for event in events.effects {
+                router.relay(event).await;
+            }
+        }
+    }
+    fn handle(&self, state: &mut T) -> Option<Events<T>>;
+}
+
+impl<T: Send + Sync> Default for Events<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> Effects<T> {
+impl<T: Send + Sync> Events<T> {
     pub fn new() -> Self {
         Self { effects: vec![] }
     }
@@ -24,51 +66,57 @@ impl<T> Effects<T> {
         Self::new()
     }
 
-    pub fn add_event(mut self, event: impl Event<T> + 'static) -> Self {
-        self.effects.push(Effect::Event(Box::new(event)));
+    pub fn push(mut self, effect: impl Into<Event<T>>) -> Self {
+        self.effects.push(effect.into());
         self
     }
 
-    pub fn add_side_effect(mut self, side_effect: impl SideEffect<T> + 'static) -> Self {
-        self.effects
-            .push(Effect::SideEffects(Box::new(side_effect)));
-        self
-    }
-
-    pub fn add_effect(mut self, effect: Effect<T>) -> Self {
-        self.effects.push(effect);
-        self
-    }
-
-    pub fn add_effects(mut self, effects: impl IntoIterator<Item = Effect<T>>) -> Self {
-        self.effects.extend(effects);
-        self
-    }
-
-    pub fn extend(mut self, other: Self) -> Self {
-        self.effects.extend(other.effects);
+    pub fn extend(mut self, other: impl Into<Self>) -> Self {
+        self.effects.extend(other.into().effects);
         self
     }
 }
 
-impl<T> From<Effect<T>> for Effects<T> {
-    fn from(effect: Effect<T>) -> Self {
+impl<T> From<Event<T>> for Events<T> {
+    fn from(effect: Event<T>) -> Self {
         Self {
             effects: vec![effect],
         }
     }
 }
 
-impl<T> From<Box<dyn Event<T>>> for Effect<T> {
-    fn from(event: Box<dyn Event<T>>) -> Self {
-        Self::Event(event)
+impl<T> From<Box<dyn Action<T>>> for Events<T> {
+    fn from(event: Box<dyn Action<T>>) -> Self {
+        Self {
+            effects: vec![Event::Action(event)],
+        }
     }
 }
 
-impl<T> From<Box<dyn Event<T>>> for Effects<T> {
-    fn from(event: Box<dyn Event<T>>) -> Self {
+impl<T> From<Box<dyn Query<T>>> for Event<T> {
+    fn from(event: Box<dyn Query<T>>) -> Self {
+        Self::Query(event)
+    }
+}
+
+impl<T> From<Box<dyn Query<T>>> for Events<T> {
+    fn from(event: Box<dyn Query<T>>) -> Self {
         Self {
-            effects: vec![Effect::Event(event)],
+            effects: vec![Event::Query(event)],
+        }
+    }
+}
+
+impl<T> From<Box<dyn Transaction<T>>> for Event<T> {
+    fn from(event: Box<dyn Transaction<T>>) -> Self {
+        Self::Transaction(event)
+    }
+}
+
+impl<T> From<Box<dyn Transaction<T>>> for Events<T> {
+    fn from(event: Box<dyn Transaction<T>>) -> Self {
+        Self {
+            effects: vec![Event::Transaction(event)],
         }
     }
 }
