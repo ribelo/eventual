@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use pollster::FutureExt;
 use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
 };
 
-use crate::effect::{Action, Event, Events, Query, Transaction};
+use crate::event::{self, Action, Event, Query, Transaction};
 
 #[derive(Clone)]
 pub struct Eve<T> {
@@ -17,9 +18,9 @@ impl<T: Send + Sync + 'static> Eve<T> {
     pub fn new(global_state: T) -> Self {
         let (action_handler, query_handler, transaction_handler, router) =
             create_eve_handlers(Arc::new(RwLock::new(global_state)));
-        tokio::spawn(run_handler_loop(action_handler));
-        tokio::spawn(run_handler_loop(query_handler));
-        tokio::spawn(run_handler_loop(transaction_handler));
+        tokio::spawn(run_action_handler_loop(action_handler));
+        tokio::spawn(run_query_handler_loop(query_handler));
+        tokio::spawn(run_transaction_handler_loop(transaction_handler));
         Self { router }
     }
     pub async fn dispatch(&self, event: impl Into<Event<T>>) {
@@ -157,18 +158,6 @@ pub trait Handler<T: Send + Sync + 'static> {
     type EventType: Send + Sync;
 
     async fn next_event(&mut self) -> Self::EventType;
-    async fn handle(&self, event: Self::EventType);
-}
-
-pub async fn run_handler_loop<T, H>(mut handler: H) -> JoinHandle<()>
-where
-    T: 'static + Send + Sync,
-    H: Handler<T> + Send + 'static,
-{
-    loop {
-        let event = handler.next_event().await;
-        handler.handle(event).await;
-    }
 }
 
 #[async_trait]
@@ -177,15 +166,6 @@ impl<T: 'static + Send + Sync> Handler<T> for EveActionHandler<T> {
     async fn next_event(&mut self) -> Self::EventType {
         self.action_rx.recv().await.expect("Action channel closed")
     }
-
-    async fn handle(self, event: Self::EventType) {
-        tokio::spawn(async move {
-            event.handle(&*self.global_state.clone().read().await).await;
-        });
-        // event
-        //     .execute(&*self.global_state.clone().read().await, &self.router)
-        //     .await;
-    }
 }
 
 #[async_trait]
@@ -193,11 +173,6 @@ impl<T: 'static + Send + Sync> Handler<T> for EveQueryHandler<T> {
     type EventType = Box<dyn Query<T>>;
     async fn next_event(&mut self) -> Self::EventType {
         self.query_rx.recv().await.expect("Query channel closed")
-    }
-    async fn handle(&self, event: Self::EventType) {
-        event
-            .execute(&*self.global_state.clone().read().await, &self.router)
-            .await;
     }
 }
 
@@ -210,10 +185,113 @@ impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
             .await
             .expect("Transaction channel closed")
     }
-    async fn handle(&self, event: Self::EventType) {
-        event
-            .execute(&mut *self.global_state.clone().write().await, &self.router)
-            .await;
+}
+
+pub async fn run_action_handler_loop<T: Send + Sync + 'static>(
+    mut handler: EveActionHandler<T>,
+) -> JoinHandle<()> {
+    let state = handler.global_state.clone();
+    loop {
+        let event = handler.next_event().await;
+        let state_clone = state.clone();
+        let router_clone = handler.router.clone();
+        match event.execution_type() {
+            event::ExecutionType::Sequential => {
+                let events = event.handle(&*state_clone.read().await).await;
+                for event in events.effects {
+                    router_clone.relay(event).await;
+                }
+            }
+            event::ExecutionType::Concurrent => {
+                tokio::spawn(async move {
+                    let events = event.handle(&*state_clone.read().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                });
+            }
+            event::ExecutionType::Parallel => rayon::spawn(move || {
+                async move {
+                    let events = event.handle(&*state_clone.read().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                }
+                .block_on()
+            }),
+        }
+    }
+}
+
+pub async fn run_query_handler_loop<T: Send + Sync + 'static>(
+    mut handler: EveQueryHandler<T>,
+) -> JoinHandle<()> {
+    let state = handler.global_state.clone();
+    loop {
+        let event = handler.next_event().await;
+        let state_clone = state.clone();
+        let router_clone = handler.router.clone();
+        match event.execution_type() {
+            event::ExecutionType::Sequential => {
+                let events = event.handle(&*state_clone.read().await).await;
+                for event in events.effects {
+                    router_clone.relay(event).await;
+                }
+            }
+            event::ExecutionType::Concurrent => {
+                tokio::spawn(async move {
+                    let events = event.handle(&*state_clone.read().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                });
+            }
+            event::ExecutionType::Parallel => rayon::spawn(move || {
+                async move {
+                    let events = event.handle(&*state_clone.read().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                }
+                .block_on()
+            }),
+        }
+    }
+}
+
+pub async fn run_transaction_handler_loop<T: Send + Sync + 'static>(
+    mut handler: EveTransactionHandler<T>,
+) -> JoinHandle<()> {
+    let state = handler.global_state.clone();
+    loop {
+        let event = handler.next_event().await;
+        let state_clone = state.clone();
+        let router_clone = handler.router.clone();
+        match event.execution_type() {
+            event::ExecutionType::Sequential => {
+                let events = event.handle(&mut *state_clone.write().await).await;
+                for event in events.effects {
+                    router_clone.relay(event).await;
+                }
+            }
+            event::ExecutionType::Concurrent => {
+                tokio::spawn(async move {
+                    let events = event.handle(&mut *state_clone.write().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                });
+            }
+            event::ExecutionType::Parallel => rayon::spawn(move || {
+                async move {
+                    let events = event.handle(&mut *state_clone.write().await).await;
+                    for event in events.effects {
+                        router_clone.relay(event).await;
+                    }
+                }
+                .block_on()
+            }),
+        }
     }
 }
 
@@ -222,6 +300,8 @@ impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
 mod tests {
 
     use async_trait::async_trait;
+
+    use crate::event::Events;
 
     use super::*;
 
@@ -236,15 +316,39 @@ mod tests {
 
         impl From<TestEvent> for Event<GlobalState> {
             fn from(event: TestEvent) -> Self {
-                Event::Action(Box::new(event))
+                Event::Transaction(Box::new(event))
             }
         }
 
         #[async_trait]
-        impl Action<GlobalState> for TestEvent {
-            async fn handle(&self, state: &GlobalState) -> Option<Events<GlobalState>> {
+        impl Transaction<GlobalState> for TestEvent {
+            async fn handle(&self, state: &mut GlobalState) -> Events<GlobalState> {
+                state.a += 1;
                 println!("TestEvent::handle {:?}", state);
-                Some(Events::new().push(TestEvent {}))
+                Events::new().push(TestEvent {})
+            }
+        }
+
+        fn fibonacci(n: u32) -> u32 {
+            match n {
+                0 => 0,
+                1 => 1,
+                _ => fibonacci(n - 1) + fibonacci(n - 2),
+            }
+        }
+        struct Fibonacci(u32);
+
+        impl From<Fibonacci> for Event<GlobalState> {
+            fn from(event: Fibonacci) -> Self {
+                Event::Transaction(Box::new(event))
+            }
+        }
+
+        #[async_trait]
+        impl Transaction<GlobalState> for Fibonacci {
+            async fn handle(&self, _state: &mut GlobalState) -> Events<GlobalState> {
+                println!("fibo {}", fibonacci(self.0));
+                Events::none()
             }
         }
 
@@ -258,7 +362,9 @@ mod tests {
         // }
 
         let eve = Eve::new(GlobalState::default());
-        eve.dispatch(TestEvent {}).await;
+        eve.dispatch(Fibonacci(40)).await;
+        // eve.executor
+        //     .spawn(async { println!("Hello from another runtime!") });
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }

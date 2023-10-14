@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 
-use crate::eve::{Handler, Router};
+pub enum ExecutionType {
+    Sequential,
+    Concurrent,
+    Parallel,
+}
 
 pub enum Event<T> {
     Action(Box<dyn Action<T>>),
@@ -14,41 +18,26 @@ pub struct Events<T> {
 
 #[async_trait]
 pub trait Action<T: Send + Sync>: Send + Sync + 'static {
-    async fn execute(&self, state: &T, router: &Router<T>) {
-        if let Some(events) = self.handle(state).await {
-            for event in events.effects {
-                router.relay(event).await;
-            }
-        }
+    fn execution_type(&self) -> ExecutionType {
+        ExecutionType::Sequential
     }
-    async fn handle(&self, state: &T) -> Option<Events<T>>;
+    async fn handle(&self, state: &T) -> Events<T>;
 }
 
 #[async_trait]
 pub trait Query<T: Send + Sync + 'static>: Send + Sync + 'static {
-    async fn execute(&self, state: &T, router: &Router<T>) {
-        if let Some(events) = self.handle(state).await {
-            for event in events.effects {
-                router.relay(event).await;
-            }
-        }
+    fn execution_type(&self) -> ExecutionType {
+        ExecutionType::Concurrent
     }
-    async fn handle(&self, state: &T) -> Option<Events<T>>;
+    async fn handle(&self, state: &T) -> Events<T>;
 }
 
 #[async_trait]
 pub trait Transaction<T: Send + Sync + 'static>: Send + Sync + 'static {
-    async fn route(&self, event: Event<T>, state: &T, router: Router<T>) {
-        router.relay(event).await;
+    fn execution_type(&self) -> ExecutionType {
+        ExecutionType::Sequential
     }
-    async fn execute(&self, state: &mut T, router: &Router<T>) {
-        if let Some(events) = self.handle(state) {
-            for event in events.effects {
-                router.relay(event).await;
-            }
-        }
-    }
-    fn handle(&self, state: &mut T) -> Option<Events<T>>;
+    async fn handle(&self, state: &mut T) -> Events<T>;
 }
 
 impl<T: Send + Sync> Default for Events<T> {
