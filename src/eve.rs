@@ -23,13 +23,13 @@ impl<T: Send + Sync + Clone + 'static> Eve<T> {
     }
 }
 
-pub struct EveActionHandler<T> {
+pub struct EveIncomingHandler<T> {
     pub global_state: T,
-    pub action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
+    pub incoming_rx: mpsc::Receiver<Box<dyn Action<T>>>,
     pub router: Router<T>,
 }
 
-impl<T> EveActionHandler<T> {
+impl<T> EveIncomingHandler<T> {
     pub fn new(
         global_state: T,
         action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
@@ -37,19 +37,19 @@ impl<T> EveActionHandler<T> {
     ) -> Self {
         Self {
             global_state,
-            action_rx,
+            incoming_rx: action_rx,
             router,
         }
     }
 }
 
-pub struct EveQueryHandler<T> {
+pub struct EveOutgoingHandler<T> {
     pub global_state: T,
     pub query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
     pub router: Router<T>,
 }
 
-impl<T> EveQueryHandler<T> {
+impl<T> EveOutgoingHandler<T> {
     pub fn new(
         global_state: T,
         query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
@@ -102,8 +102,8 @@ impl<T> Clone for Router<T> {
 pub fn create_eve_handlers<T: Send + Sync + Clone + 'static>(
     global_state: T,
 ) -> (
-    EveActionHandler<T>,
-    EveQueryHandler<T>,
+    EveIncomingHandler<T>,
+    EveOutgoingHandler<T>,
     EveTransactionHandler<T>,
     Router<T>,
 ) {
@@ -116,8 +116,8 @@ pub fn create_eve_handlers<T: Send + Sync + Clone + 'static>(
         transaction_tx,
     };
     (
-        EveActionHandler::new(global_state.clone(), action_rx, router.clone()),
-        EveQueryHandler::new(global_state.clone(), query_rx, router.clone()),
+        EveIncomingHandler::new(global_state.clone(), action_rx, router.clone()),
+        EveOutgoingHandler::new(global_state.clone(), query_rx, router.clone()),
         EveTransactionHandler::new(global_state, transaction_rx, router.clone()),
         router,
     )
@@ -126,19 +126,19 @@ pub fn create_eve_handlers<T: Send + Sync + Clone + 'static>(
 impl<T> Router<T> {
     pub async fn relay(&self, event: Event<T>) {
         match event {
-            Event::Action(event) => {
+            Event::Action(event, ..) => {
                 self.action_tx
                     .send(event)
                     .await
                     .expect("Action channel closed");
             }
-            Event::Query(event) => {
+            Event::Query(event, ..) => {
                 self.query_tx
                     .send(event)
                     .await
                     .expect("Query channel closed");
             }
-            Event::Transaction(event) => {
+            Event::Transaction(event, ..) => {
                 self.transaction_tx
                     .send(event)
                     .await
@@ -156,15 +156,18 @@ pub trait Handler<T: Send + Sync + 'static> {
 }
 
 #[async_trait]
-impl<T: 'static + Send + Sync> Handler<T> for EveActionHandler<T> {
+impl<T: 'static + Send + Sync> Handler<T> for EveIncomingHandler<T> {
     type EventType = Box<dyn Action<T>>;
     async fn next_event(&mut self) -> Self::EventType {
-        self.action_rx.recv().await.expect("Action channel closed")
+        self.incoming_rx
+            .recv()
+            .await
+            .expect("Action channel closed")
     }
 }
 
 #[async_trait]
-impl<T: 'static + Send + Sync> Handler<T> for EveQueryHandler<T> {
+impl<T: 'static + Send + Sync> Handler<T> for EveOutgoingHandler<T> {
     type EventType = Box<dyn Query<T>>;
     async fn next_event(&mut self) -> Self::EventType {
         self.query_rx.recv().await.expect("Query channel closed")
@@ -183,7 +186,7 @@ impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
 }
 
 pub async fn run_action_handler_loop<T: Send + Sync + Clone + 'static>(
-    mut handler: EveActionHandler<T>,
+    mut handler: EveIncomingHandler<T>,
 ) -> JoinHandle<()> {
     let state = handler.global_state.clone();
     loop {
@@ -222,7 +225,7 @@ pub async fn run_action_handler_loop<T: Send + Sync + Clone + 'static>(
 }
 
 pub async fn run_query_handler_loop<T: Send + Sync + Clone + 'static>(
-    mut handler: EveQueryHandler<T>,
+    mut handler: EveOutgoingHandler<T>,
 ) -> JoinHandle<()> {
     let state = handler.global_state.clone();
     loop {

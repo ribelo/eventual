@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use eventual::{
     eve::Eve,
-    event::{Action, Event, Events, Transaction},
+    event::{Action, Events, IncomingEvent, Transaction},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -12,9 +12,9 @@ struct GlobalState {
 
 struct Ping;
 
-impl From<Ping> for Event<GlobalState> {
+impl From<Ping> for IncomingEvent<GlobalState> {
     fn from(event: Ping) -> Self {
-        Event::Transaction(Box::new(event))
+        IncomingEvent::Transaction(Box::new(event))
     }
 }
 
@@ -36,9 +36,9 @@ fn fibonacci(n: u32) -> u32 {
 
 struct Fibonacci(u32);
 
-impl From<Fibonacci> for Event<GlobalState> {
+impl From<Fibonacci> for IncomingEvent<GlobalState> {
     fn from(event: Fibonacci) -> Self {
-        Event::Transaction(Box::new(event))
+        IncomingEvent::Transaction(Box::new(event))
     }
 }
 

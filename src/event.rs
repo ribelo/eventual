@@ -1,4 +1,7 @@
+use std::any::Any;
+
 use async_trait::async_trait;
+use thiserror::Error;
 
 pub enum ExecutionType {
     Sequential,
@@ -6,10 +9,37 @@ pub enum ExecutionType {
     Parallel,
 }
 
+pub struct CorrelationId(u64);
+
+#[derive(Error, Debug)]
+pub enum ResponderError {}
+
+#[async_trait]
+pub trait Responder {
+    async fn respond(&self, data: Box<dyn Any + Send + Sync>) -> Result<(), ResponderError>;
+}
+
 pub enum Event<T> {
-    Action(Box<dyn Action<T>>),
-    Query(Box<dyn Query<T>>),
-    Transaction(Box<dyn Transaction<T>>),
+    Action {
+        id: CorrelationId,
+        event: Box<dyn Action<T>>,
+        responder: Option<Box<dyn Responder>>,
+    },
+    Query {
+        id: CorrelationId,
+        event: Box<dyn Query<T>>,
+        responder: Option<Box<dyn Responder>>,
+    },
+    Transaction {
+        id: CorrelationId,
+        event: Box<dyn Action<T>>,
+        responder: Option<Box<dyn Responder>>,
+    },
+    Response {
+        id: CorrelationId,
+        event: Box<dyn Action<T>>,
+        responder: Option<Box<dyn Responder>>,
+    },
 }
 
 pub struct Events<T> {
@@ -40,6 +70,14 @@ pub trait Transaction<T: Send + Sync + 'static>: Send + Sync + 'static {
     async fn handle(&self, state: &mut T) -> Events<T>;
 }
 
+#[async_trait]
+pub trait Response<T: Send + Sync + 'static>: Send + Sync + 'static {
+    fn execution_type(&self) -> ExecutionType {
+        ExecutionType::Sequential
+    }
+    async fn handle(&self) -> Events<T>;
+}
+
 impl<T: Send + Sync> Default for Events<T> {
     fn default() -> Self {
         Self::new()
@@ -63,49 +101,5 @@ impl<T: Send + Sync> Events<T> {
     pub fn extend(mut self, other: impl Into<Self>) -> Self {
         self.effects.extend(other.into().effects);
         self
-    }
-}
-
-impl<T> From<Event<T>> for Events<T> {
-    fn from(effect: Event<T>) -> Self {
-        Self {
-            effects: vec![effect],
-        }
-    }
-}
-
-impl<T> From<Box<dyn Action<T>>> for Events<T> {
-    fn from(event: Box<dyn Action<T>>) -> Self {
-        Self {
-            effects: vec![Event::Action(event)],
-        }
-    }
-}
-
-impl<T> From<Box<dyn Query<T>>> for Event<T> {
-    fn from(event: Box<dyn Query<T>>) -> Self {
-        Self::Query(event)
-    }
-}
-
-impl<T> From<Box<dyn Query<T>>> for Events<T> {
-    fn from(event: Box<dyn Query<T>>) -> Self {
-        Self {
-            effects: vec![Event::Query(event)],
-        }
-    }
-}
-
-impl<T> From<Box<dyn Transaction<T>>> for Event<T> {
-    fn from(event: Box<dyn Transaction<T>>) -> Self {
-        Self::Transaction(event)
-    }
-}
-
-impl<T> From<Box<dyn Transaction<T>>> for Events<T> {
-    fn from(event: Box<dyn Transaction<T>>) -> Self {
-        Self {
-            effects: vec![Event::Transaction(event)],
-        }
     }
 }
