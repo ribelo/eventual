@@ -1,377 +1,101 @@
-use async_trait::async_trait;
-use pollster::FutureExt;
-use tokio::{sync::mpsc, task::JoinHandle};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::{
+    any::{type_name, Any},
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::mpsc;
 
-use crate::event::{self, Action, Event, Query, Transaction};
+use crate::{
+    event::{Event, Message},
+    id::Id,
+    magic_handler::{CommonFn, Context, Handler, HandlerWrapper},
+};
 
-#[derive(Clone)]
-pub struct Eve<T> {
-    router: Router<T>,
+#[derive(Clone, Debug)]
+pub struct Eventual {
+    message_tx: mpsc::UnboundedSender<Message>,
+    handlers: Arc<Mutex<HashMap<Id, Vec<Box<dyn CommonFn>>>>>,
 }
 
-impl<T: Send + Sync + Clone + 'static> Eve<T> {
-    pub fn new(global_state: T) -> Self {
-        let (action_handler, query_handler, transaction_handler, router) =
-            create_eve_handlers(global_state);
-        tokio::spawn(run_action_handler_loop(action_handler));
-        tokio::spawn(run_query_handler_loop(query_handler));
-        tokio::spawn(run_transaction_handler_loop(transaction_handler));
-        Self { router }
-    }
-    pub async fn dispatch(&self, event: impl Into<Event<T>>) {
-        self.router.relay(event.into()).await;
-    }
-}
-
-pub struct EveIncomingHandler<T> {
-    pub global_state: T,
-    pub incoming_rx: mpsc::Receiver<Box<dyn Action<T>>>,
-    pub router: Router<T>,
-}
-
-impl<T> EveIncomingHandler<T> {
-    pub fn new(
-        global_state: T,
-        action_rx: mpsc::Receiver<Box<dyn Action<T>>>,
-        router: Router<T>,
-    ) -> Self {
-        Self {
-            global_state,
-            incoming_rx: action_rx,
-            router,
-        }
+impl Default for Eventual {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-pub struct EveOutgoingHandler<T> {
-    pub global_state: T,
-    pub query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
-    pub router: Router<T>,
-}
+impl Eventual {
+    pub fn new() -> Self {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let eve = Self {
+            message_tx,
+            handlers: Default::default(),
+        };
+        run_events_loop(message_rx, eve.clone());
+        eve
+    }
 
-impl<T> EveOutgoingHandler<T> {
-    pub fn new(
-        global_state: T,
-        query_rx: mpsc::Receiver<Box<dyn Query<T>>>,
-        router: Router<T>,
-    ) -> Self {
-        Self {
-            global_state,
-            query_rx,
-            router,
-        }
+    pub fn reg_handler<E, T, H>(&mut self, handler: H)
+    where
+        E: Event,
+        T: Send + Sync + 'static,
+        H: Handler<T> + Copy + 'static,
+    {
+        let id = Id::new::<E>();
+        let wrapper = HandlerWrapper {
+            handler,
+            phantom: PhantomData::<T>,
+        };
+        self.handlers
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .push(Box::new(wrapper));
+    }
+
+    pub fn dispatch<E: Event>(&self, event: E) {
+        self.message_tx.send(Message::new(event)).unwrap();
     }
 }
 
-pub struct EveTransactionHandler<T> {
-    pub global_state: T,
-    pub transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
-    pub router: Router<T>,
-}
-
-impl<T> EveTransactionHandler<T> {
-    pub fn new(
-        global_state: T,
-        transaction_rx: mpsc::Receiver<Box<dyn Transaction<T>>>,
-        router: Router<T>,
-    ) -> Self {
-        Self {
-            global_state,
-            transaction_rx,
-            router,
-        }
-    }
-}
-
-pub struct Router<T> {
-    pub action_tx: mpsc::Sender<Box<dyn Action<T>>>,
-    pub query_tx: mpsc::Sender<Box<dyn Query<T>>>,
-    pub transaction_tx: mpsc::Sender<Box<dyn Transaction<T>>>,
-}
-
-impl<T> Clone for Router<T> {
-    fn clone(&self) -> Self {
-        Self {
-            action_tx: self.action_tx.clone(),
-            query_tx: self.query_tx.clone(),
-            transaction_tx: self.transaction_tx.clone(),
-        }
-    }
-}
-
-pub fn create_eve_handlers<T: Send + Sync + Clone + 'static>(
-    global_state: T,
-) -> (
-    EveIncomingHandler<T>,
-    EveOutgoingHandler<T>,
-    EveTransactionHandler<T>,
-    Router<T>,
-) {
-    let (action_tx, action_rx) = mpsc::channel(100);
-    let (query_tx, query_rx) = mpsc::channel(100);
-    let (transaction_tx, transaction_rx) = mpsc::channel(100);
-    let router = Router {
-        action_tx,
-        query_tx,
-        transaction_tx,
-    };
-    (
-        EveIncomingHandler::new(global_state.clone(), action_rx, router.clone()),
-        EveOutgoingHandler::new(global_state.clone(), query_rx, router.clone()),
-        EveTransactionHandler::new(global_state, transaction_rx, router.clone()),
-        router,
-    )
-}
-
-impl<T> Router<T> {
-    pub async fn relay(&self, event: Event<T>) {
-        match event {
-            Event::Action(event, ..) => {
-                self.action_tx
-                    .send(event)
-                    .await
-                    .expect("Action channel closed");
-            }
-            Event::Query(event, ..) => {
-                self.query_tx
-                    .send(event)
-                    .await
-                    .expect("Query channel closed");
-            }
-            Event::Transaction(event, ..) => {
-                self.transaction_tx
-                    .send(event)
-                    .await
-                    .expect("Transaction channel closed");
-            }
-        }
-    }
-}
-
-#[async_trait]
-pub trait Handler<T: Send + Sync + 'static> {
-    type EventType: Send + Sync;
-
-    async fn next_event(&mut self) -> Self::EventType;
-}
-
-#[async_trait]
-impl<T: 'static + Send + Sync> Handler<T> for EveIncomingHandler<T> {
-    type EventType = Box<dyn Action<T>>;
-    async fn next_event(&mut self) -> Self::EventType {
-        self.incoming_rx
-            .recv()
-            .await
-            .expect("Action channel closed")
-    }
-}
-
-#[async_trait]
-impl<T: 'static + Send + Sync> Handler<T> for EveOutgoingHandler<T> {
-    type EventType = Box<dyn Query<T>>;
-    async fn next_event(&mut self) -> Self::EventType {
-        self.query_rx.recv().await.expect("Query channel closed")
-    }
-}
-
-#[async_trait]
-impl<T: 'static + Send + Sync> Handler<T> for EveTransactionHandler<T> {
-    type EventType = Box<dyn Transaction<T>>;
-    async fn next_event(&mut self) -> Self::EventType {
-        self.transaction_rx
-            .recv()
-            .await
-            .expect("Transaction channel closed")
-    }
-}
-
-pub async fn run_action_handler_loop<T: Send + Sync + Clone + 'static>(
-    mut handler: EveIncomingHandler<T>,
-) -> JoinHandle<()> {
-    let state = handler.global_state.clone();
-    loop {
-        let event = handler.next_event().await;
-        let router_clone = handler.router.clone();
-        match event.execution_type() {
-            event::ExecutionType::Sequential => {
-                let events = event.handle(&state).await;
-                for event in events.effects {
-                    router_clone.relay(event).await;
+fn run_events_loop(mut message_rx: mpsc::UnboundedReceiver<Message>, eve: Eventual) {
+    tokio::spawn(async move {
+        loop {
+            while let Some(msg) = message_rx.recv().await {
+                let maybe_handlers = eve.handlers.lock().unwrap().get(&msg.id).cloned();
+                if let Some(handlers) = maybe_handlers {
+                    let ctx = Context::new(msg.event, eve.clone());
+                    for handler in handlers {
+                        let cloned_ctx = ctx.clone();
+                        tokio::spawn(async move { handler.call_with_context(cloned_ctx).await });
+                    }
                 }
             }
-            event::ExecutionType::Concurrent => {
-                let state_clone = state.clone();
-                tokio::spawn(async move {
-                    let events = event.handle(&state_clone).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
-                    }
-                });
-            }
-            event::ExecutionType::Parallel => {
-                let state_clone = state.clone();
-                rayon::spawn(move || {
-                    async move {
-                        let events = event.handle(&state_clone).await;
-                        for event in events.effects {
-                            router_clone.relay(event).await;
-                        }
-                    }
-                    .block_on()
-                })
-            }
         }
-    }
+    });
 }
 
-pub async fn run_query_handler_loop<T: Send + Sync + Clone + 'static>(
-    mut handler: EveOutgoingHandler<T>,
-) -> JoinHandle<()> {
-    let state = handler.global_state.clone();
-    loop {
-        let event = handler.next_event().await;
-        let router_clone = handler.router.clone();
-        match event.execution_type() {
-            event::ExecutionType::Sequential => {
-                let events = event.handle(&state).await;
-                for event in events.effects {
-                    router_clone.relay(event).await;
-                }
-            }
-            event::ExecutionType::Concurrent => {
-                let state_clone = state.clone();
-                tokio::spawn(async move {
-                    let events = event.handle(&state_clone).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
-                    }
-                });
-            }
-            event::ExecutionType::Parallel => {
-                let state_clone = state.clone();
-                rayon::spawn(move || {
-                    async move {
-                        let events = event.handle(&state_clone).await;
-                        for event in events.effects {
-                            router_clone.relay(event).await;
-                        }
-                    }
-                    .block_on()
-                })
-            }
-        }
-    }
-}
-
-pub async fn run_transaction_handler_loop<T: Send + Sync + Clone + 'static>(
-    mut handler: EveTransactionHandler<T>,
-) -> JoinHandle<()> {
-    let mut state = handler.global_state.clone();
-    loop {
-        let event = handler.next_event().await;
-        let router_clone = handler.router.clone();
-        match event.execution_type() {
-            event::ExecutionType::Sequential => {
-                let events = event.handle(&mut state).await;
-                for event in events.effects {
-                    router_clone.relay(event).await;
-                }
-            }
-            event::ExecutionType::Concurrent => {
-                let mut state_clone = state.clone();
-                tokio::spawn(async move {
-                    let events = event.handle(&mut state_clone).await;
-                    for event in events.effects {
-                        router_clone.relay(event).await;
-                    }
-                });
-            }
-            event::ExecutionType::Parallel => {
-                let mut state_clone = state.clone();
-                rayon::spawn(move || {
-                    async move {
-                        let events = event.handle(&mut state_clone).await;
-                        for event in events.effects {
-                            router_clone.relay(event).await;
-                        }
-                    }
-                    .block_on()
-                })
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
-
-    use async_trait::async_trait;
-
-    use crate::event::Events;
+    use crate::magic_handler::{Eve, Evt};
 
     use super::*;
 
     #[tokio::test]
     async fn it_works() {
-        #[derive(Debug, Default, Clone)]
-        struct GlobalState {
-            a: i32,
+        #[derive(Debug, Clone)]
+        struct Ping;
+        impl Event for Ping {}
+
+        async fn ping_handler(eve: Eve, event: Evt) {
+            println!("ping {:?}", event);
         }
 
-        struct TestEvent {}
+        let mut eve = Eventual::new();
+        eve.reg_handler::<Ping, _, _>(ping_handler);
+        eve.dispatch(Ping);
 
-        impl From<TestEvent> for Event<GlobalState> {
-            fn from(event: TestEvent) -> Self {
-                Event::Transaction(Box::new(event))
-            }
-        }
-
-        #[async_trait]
-        impl Transaction<GlobalState> for TestEvent {
-            async fn handle(&self, state: &mut GlobalState) -> Events<GlobalState> {
-                state.a += 1;
-                println!("TestEvent::handle {:?}", state);
-                Events::new().push(TestEvent {})
-            }
-        }
-
-        fn fibonacci(n: u32) -> u32 {
-            match n {
-                0 => 0,
-                1 => 1,
-                _ => fibonacci(n - 1) + fibonacci(n - 2),
-            }
-        }
-        struct Fibonacci(u32);
-
-        impl From<Fibonacci> for Event<GlobalState> {
-            fn from(event: Fibonacci) -> Self {
-                Event::Transaction(Box::new(event))
-            }
-        }
-
-        #[async_trait]
-        impl Transaction<GlobalState> for Fibonacci {
-            async fn handle(&self, _state: &mut GlobalState) -> Events<GlobalState> {
-                println!("fibo {}", fibonacci(self.0));
-                Events::none()
-            }
-        }
-
-        // #[async_trait]
-        // impl Transaction<GlobalState> for TestEvent {
-        //     async fn handle(&self, state: &mut GlobalState) -> Events<GlobalState> {
-        //         state.a += 1;
-        //         println!("TestEvent::handle {:?}", state);
-        //         Events::new().add_action(TestEvent {})
-        //     }
-        // }
-
-        let eve = Eve::new(GlobalState::default());
-        eve.dispatch(Fibonacci(40)).await;
-        // eve.executor
-        //     .spawn(async { println!("Hello from another runtime!") });
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }

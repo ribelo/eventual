@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use eventual::{
-    eve::Eve,
+    eve::EveHandler,
     event::{Action, Events, IncomingEvent, Transaction},
 };
 
@@ -54,7 +54,7 @@ fn benchmarks(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut eve = None;
     runtime.block_on(async {
-        eve = Some(Eve::new(GlobalState::default()));
+        eve = Some(EveHandler::new(GlobalState::default()));
     });
     let eve = std::mem::take(&mut eve).unwrap();
     c.bench_function("eve send ping 1e5", |b| {
@@ -69,7 +69,7 @@ fn benchmarks(c: &mut Criterion) {
     c.bench_function("eve calc fibo 10x40", |b| {
         b.iter(|| {
             runtime.block_on(async {
-                let eve = Eve::new(GlobalState::default());
+                let eve = EveHandler::new(GlobalState::default());
                 for _ in 0..1 {
                     eve.dispatch(Fibonacci(40)).await;
                 }
