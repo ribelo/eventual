@@ -4,53 +4,57 @@ use std::{fmt, future::Future, marker::PhantomData, ops::Deref};
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 
-use crate::{eve::Eve, event::Event, id::Id};
+use crate::{eve::Eve, event::Eventable, id::Id, reactive::Node, BoxableValue};
 
 #[derive(Clone)]
-pub struct EventContext {
-    pub(crate) event: Option<Box<dyn Event>>,
-    pub(crate) eventual: Eve,
+pub struct EventContext<'a, S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    pub(crate) event: Box<dyn Eventable>,
+    pub(crate) eve: &'a Eve<S>,
 }
 
-impl EventContext {
-    pub fn new(event: Box<dyn Event>, eventual: Eve) -> Self {
-        EventContext {
-            event: Some(event),
-            eventual,
-        }
+impl<'a, S> EventContext<'a, S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    pub fn new(event: Box<dyn Eventable>, eve: &'a Eve<S>) -> Self {
+        EventContext { event, eve }
     }
 }
 
-pub trait FromEventContext: Send + Sync + 'static {
-    fn from_context(context: &EventContext) -> Self;
-
-    #[allow(unused_variables)]
-    fn collect_dependencies(deps: &mut HashSet<Id>) {}
+#[async_trait]
+pub trait FromEventContext<S>: Send + Sync + 'static
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn from_context(context: &EventContext<S>) -> Self;
 }
 
 #[async_trait]
-pub trait EventHandler<T>: Send + Sync + DynClone {
-    async fn call(&self, context: &EventContext);
-    fn collect_dependencies(&self, deps: &mut HashSet<Id>);
+pub trait EventHandler<E, S, T>: Send + Sync + DynClone
+where
+    E: Eventable,
+    S: Send + Sync + Clone + 'static,
+{
+    async fn call(&self, event: E, context: &EventContext<S>);
 }
-dyn_clone::clone_trait_object!(<T> EventHandler<T>);
+dyn_clone::clone_trait_object!(<E, S, T> EventHandler<E, S, T>);
 
 macro_rules! tuple_impls {
     ($($t:ident),*; $f:ident) => {
         #[async_trait]
-        impl<$($t),*, $f, Fut> EventHandler<($($t,)*)> for $f
+        impl<E, S, $($t),*, $f, Fut> EventHandler<E, S, ($($t,)*)> for $f
         where
-            $f: Fn($($t),*) -> Fut + Send + Sync + Clone,
-            $($t: FromEventContext,)*
+            E: Eventable,
+            S: Send + Sync + Clone + 'static,
+            $f: Fn(E, $($t),*) -> Fut + Send + Sync + Clone,
+            $($t: FromEventContext<S>,)*
             Fut: Future<Output = ()> + Send,
         {
-            async fn call(&self, context: & EventContext) {
-                (self)($(<$t>::from_context(&context),)*).await;
-            }
-            fn collect_dependencies(&self, deps: &mut HashSet<Id>) {
-                $(
-                    <$t as FromEventContext>::collect_dependencies(deps);
-                )*
+            async fn call(&self, event: E, context: &EventContext<S>) {
+                (self)(event, $(<$t>::from_context(&context).await,)*).await;
             }
         }
     }
@@ -76,32 +80,43 @@ impl_handler!((T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11), F);
 impl_handler!((T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12), F);
 
 #[async_trait]
-pub trait EventHandlerFn: Send + Sync + DynClone {
-    async fn call_with_context(&self, context: &EventContext);
+pub trait EventHandlerFn<S>: Send + Sync + DynClone
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn call_with_context(&self, context: &EventContext<S>);
 }
-dyn_clone::clone_trait_object!(EventHandlerFn);
+dyn_clone::clone_trait_object!(<S> EventHandlerFn<S>);
 
-impl fmt::Debug for dyn EventHandlerFn {
+impl<S> fmt::Debug for dyn EventHandlerFn<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommonFn").finish()
     }
 }
 
-pub(crate) struct EventHandlerWrapper<H: EventHandler<T> + Copy, T> {
+pub(crate) struct EventHandlerWrapper<E, S, H: EventHandler<E, S, T> + Copy, T>
+where
+    E: Eventable,
+    S: Send + Sync + Clone + 'static,
+{
     pub handler: H,
-    pub phantom: PhantomData<T>,
+    pub phantom: PhantomData<(E, S, T)>,
 }
 
-impl<H, T> Copy for EventHandlerWrapper<H, T>
+impl<E, S, H, T> Copy for EventHandlerWrapper<E, S, H, T>
 where
-    H: EventHandler<T> + Copy,
+    E: Eventable,
+    S: Send + Sync + Clone + 'static,
+    H: EventHandler<E, S, T> + Copy,
     T: Send + Sync,
 {
 }
 
-impl<H, T> Clone for EventHandlerWrapper<H, T>
+impl<E, S, H, T> Clone for EventHandlerWrapper<E, S, H, T>
 where
-    H: EventHandler<T> + Copy,
+    E: Eventable,
+    S: Send + Sync + Clone + 'static,
+    H: EventHandler<E, S, T> + Copy,
     T: Send + Sync,
 {
     fn clone(&self) -> Self {
@@ -110,41 +125,56 @@ where
 }
 
 #[async_trait]
-impl<H, T> EventHandlerFn for EventHandlerWrapper<H, T>
+impl<E, S, H, T> EventHandlerFn<S> for EventHandlerWrapper<E, S, H, T>
 where
-    H: EventHandler<T> + Copy,
+    E: Eventable + Clone,
+    S: Send + Sync + Clone + 'static,
+    H: EventHandler<E, S, T> + Copy,
     T: Send + Sync,
 {
-    async fn call_with_context(&self, context: &EventContext) {
-        self.handler.call(context).await;
+    async fn call_with_context(&self, context: &EventContext<S>) {
+        let event = context.event.clone().downcast::<E>().unwrap();
+        self.handler.call(*event, context).await;
     }
 }
 
-impl FromEventContext for Eve {
-    fn from_context(context: &EventContext) -> Self {
-        context.eventual.clone()
+#[async_trait]
+impl<S> FromEventContext<S> for Eve<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn from_context(context: &EventContext<S>) -> Self {
+        context.eve.clone()
     }
 }
 
-#[derive(Debug)]
-pub struct Evt<E: Event>(pub E);
+pub struct State<S: Send + Sync + Clone + 'static>(pub S);
 
-impl<E: Event> Deref for Evt<E> {
-    type Target = E;
+impl<S: Send + Sync + Clone + 'static> Deref for State<S> {
+    type Target = S;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<E: Event + Clone> FromEventContext for Evt<E> {
-    fn from_context(context: &EventContext) -> Self {
-        Evt(context
-            .event
-            .as_ref()
-            .unwrap()
-            .downcast_ref::<E>()
-            .unwrap()
-            .clone())
+#[async_trait]
+impl<S> FromEventContext<S> for State<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn from_context(context: &EventContext<S>) -> Self {
+        State(context.eve.state.clone())
+    }
+}
+
+#[async_trait]
+impl<S, T: BoxableValue + Clone> FromEventContext<S> for Node<T>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn from_context(context: &EventContext<S>) -> Self {
+        println!("type: {:?}", std::any::type_name::<T>());
+        Node(context.eve.get_node::<T>().await.unwrap())
     }
 }
 
@@ -158,14 +188,16 @@ mod tests {
 
         pub struct Uid(pub u32);
 
-        impl FromEventContext for Param {
-            fn from_context(_context: &EventContext) -> Self {
+        #[async_trait]
+        impl FromEventContext<()> for Param {
+            async fn from_context(_context: &EventContext<()>) -> Self {
                 Param("foo".to_string())
             }
         }
 
-        impl FromEventContext for Uid {
-            fn from_context(_context: &EventContext) -> Self {
+        #[async_trait]
+        impl FromEventContext<()> for Uid {
+            async fn from_context(_context: &EventContext<()>) -> Self {
                 Uid(7)
             }
         }
@@ -186,7 +218,7 @@ mod tests {
 
         #[derive(Debug, Clone)]
         struct Ping;
-        impl Event for Ping {}
+        impl Eventable for Ping {}
 
         // let eve = Eve::new();
         // let context = EventContext::new(Box::new(Ping), eve);

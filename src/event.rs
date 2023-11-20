@@ -12,21 +12,30 @@ use crate::{
 };
 
 #[async_trait]
-pub trait Event: DowncastSync + DynClone + fmt::Debug + 'static {}
-impl_downcast!(sync Event);
-dyn_clone::clone_trait_object!(Event);
+pub trait Eventable: DowncastSync + DynClone + fmt::Debug + 'static {}
+impl_downcast!(sync Eventable);
+dyn_clone::clone_trait_object!(Eventable);
 
 #[derive(Debug)]
 pub struct Message {
     pub id: Id,
-    pub event: Box<dyn Event>,
+    pub event: Box<dyn Eventable>,
+    pub tx: Option<oneshot::Sender<()>>,
 }
 
 impl Message {
-    pub fn new<E: Event>(event: E) -> Self {
+    pub fn new<E: Eventable>(event: E) -> Self {
         Self {
             id: Id::new::<E>(),
             event: Box::new(event),
+            tx: None,
+        }
+    }
+    pub fn new_sync<E: Eventable>(event: E, tx: oneshot::Sender<()>) -> Self {
+        Self {
+            id: Id::new::<E>(),
+            event: Box::new(event),
+            tx: Some(tx),
         }
     }
 }

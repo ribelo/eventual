@@ -69,13 +69,16 @@ impl NodeValue {
 
 pub struct Node<T: BoxableValue + Clone + 'static>(pub T);
 
-impl EveBuilder {
+impl<S> EveBuilder<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
     pub fn reg_reactive(
         &mut self,
         id: Id,
         sources: HashSet<Id>,
         value: NodeValue,
-        reactive: Arc<dyn Reactive>,
+        reactive: Arc<dyn Reactive<S>>,
     ) {
         self.statuses.insert(id, NodeState::Dirty);
 
@@ -94,7 +97,7 @@ impl EveBuilder {
         self.reactive.insert(id, reactive);
     }
 
-    pub fn add_signal<F, R>(mut self, factory: F) -> Self
+    pub fn reg_signal<F, R>(mut self, factory: F) -> Self
     where
         F: Fn() -> R + Send + Sync + Clone + 'static,
         R: BoxableValue + Clone + PartialEq + 'static,
@@ -111,9 +114,9 @@ impl EveBuilder {
         self
     }
 
-    pub fn add_memo<H, T, R>(mut self, handler: H) -> Self
+    pub fn reg_memo<H, T, R>(mut self, handler: H) -> Self
     where
-        H: EffectHandler<T, R> + Clone + 'static,
+        H: EffectHandler<S, T, R> + Clone + 'static,
         T: Send + Sync + 'static,
         R: BoxableValue + Clone + PartialEq + 'static,
     {
@@ -121,15 +124,15 @@ impl EveBuilder {
         handler.collect_dependencies(&mut sources);
 
         let id = Id::new::<R>();
-        let anchor: MemoAnchor<H, T, R> = MemoAnchor::new(handler);
+        let anchor: MemoAnchor<S, H, T, R> = MemoAnchor::new(handler);
         self.reg_reactive(id, sources, NodeValue::Uninitialized, Arc::new(anchor));
 
         self
     }
 
-    pub fn add_effect<H, T>(mut self, handler: H) -> Self
+    pub fn reg_effect<H, T>(mut self, handler: H) -> Self
     where
-        H: EffectHandler<T, ()> + Clone + 'static,
+        H: EffectHandler<S, T, ()> + Clone + 'static,
         T: Send + Sync + 'static,
     {
         let mut sources = HashSet::default();
@@ -137,7 +140,7 @@ impl EveBuilder {
 
         let id = Id::new::<H>();
         println!("effect id: {:?} {}", id, id);
-        let anchor: EffectAnchor<H, T> = EffectAnchor::new(handler);
+        let anchor: EffectAnchor<S, H, T> = EffectAnchor::new(handler);
         self.reg_reactive(id, sources, NodeValue::Void, Arc::new(anchor));
         self.effects.insert(id);
 
@@ -145,7 +148,10 @@ impl EveBuilder {
     }
 }
 
-impl Eve {
+impl<S> Eve<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
     fn get_node_state(&self, id: Id) -> Option<NodeState> {
         self.statuses.get(&id).map(|state| *state.lock().unwrap())
     }
@@ -188,7 +194,7 @@ impl Eve {
         }
     }
 
-    fn get_reactive(&self, id: Id) -> Option<Arc<dyn Reactive>> {
+    fn get_reactive(&self, id: Id) -> Option<Arc<dyn Reactive<S>>> {
         self.reactive.get(&id).cloned()
     }
 
@@ -282,7 +288,7 @@ impl Eve {
         }
     }
 
-    pub fn get_signal<R>(&self) -> Option<Signal<R>>
+    pub fn get_signal<R>(&self) -> Option<Signal<S, R>>
     where
         R: BoxableValue + Clone + PartialEq + 'static,
     {
@@ -294,7 +300,7 @@ impl Eve {
         }
     }
 
-    pub fn get_memo<R>(&self) -> Option<Memo<R>>
+    pub fn get_memo<R>(&self) -> Option<Memo<S, R>>
     where
         R: BoxableValue + Clone + PartialEq + 'static,
     {
@@ -311,12 +317,15 @@ pub trait Observable: Send + Sync + Clone + fmt::Debug + 'static {}
 impl<T: Send + Sync + Clone + fmt::Debug + 'static> Observable for T {}
 
 #[async_trait]
-pub trait Reactive: DynClone + Send + Sync + 'static {
-    async fn changed(&self, eve: &Eve) -> bool;
+pub trait Reactive<S>: DynClone + Send + Sync + 'static
+where
+    S: Send + Sync,
+{
+    async fn changed(&self, eve: &Eve<S>) -> bool;
 }
-dyn_clone::clone_trait_object!(Reactive);
+dyn_clone::clone_trait_object!(<S> Reactive<S>);
 
-impl fmt::Debug for dyn Reactive {
+impl<S> fmt::Debug for dyn Reactive<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reactive").finish()
     }
@@ -334,24 +343,28 @@ impl TriggerAnchor {
 }
 
 #[async_trait]
-impl Reactive for TriggerAnchor {
-    async fn changed(&self, _eve: &Eve) -> bool {
+impl<S: Send + Sync> Reactive<S> for TriggerAnchor {
+    async fn changed(&self, _eve: &Eve<S>) -> bool {
         true
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Signal<R> {
+pub struct Signal<S, R>
+where
+    S: Send + Sync,
+{
     pub id: Id,
     phantom: PhantomData<R>,
-    eve: Eve,
+    eve: Eve<S>,
 }
 
-impl<R> Signal<R>
+impl<S, R> Signal<S, R>
 where
     R: BoxableValue + Clone + PartialEq + 'static,
+    S: Send + Sync + Clone + 'static,
 {
-    pub fn new(eve: Eve) -> Self {
+    pub fn new(eve: Eve<S>) -> Self {
         Self {
             id: Id::new::<R>(),
             phantom: PhantomData,
@@ -421,12 +434,13 @@ where
 }
 
 #[async_trait]
-impl<F, R> Reactive for SignalAnchor<F, R>
+impl<S, F, R> Reactive<S> for SignalAnchor<F, R>
 where
+    S: Send + Sync + Clone + 'static,
     F: Fn() -> R + Send + Sync + Clone + 'static,
     R: BoxableValue + Clone + 'static,
 {
-    async fn changed(&self, eve: &Eve) -> bool {
+    async fn changed(&self, eve: &Eve<S>) -> bool {
         let node_value = eve.get_node_boxed_value(self.id).expect("node not found");
         let mut guard = node_value.lock().unwrap();
         if let NodeValue::Uninitialized = *guard {
@@ -438,20 +452,22 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct Memo<R>
+pub struct Memo<S, R>
 where
+    S: Send + Sync + Clone + 'static,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
     pub id: Id,
     phantom: PhantomData<R>,
-    eve: Eve,
+    eve: Eve<S>,
 }
 
-impl<R> Memo<R>
+impl<S, R> Memo<S, R>
 where
+    S: Send + Sync + Clone + 'static,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
-    pub fn new(eve: Eve) -> Self {
+    pub fn new(eve: Eve<S>) -> Self {
         Self {
             id: Id::new::<R>(),
             phantom: PhantomData,
@@ -459,23 +475,25 @@ where
         }
     }
     pub async fn get(&self) -> R {
-        self.eve.get_node_value::<R>().unwrap()
+        self.eve.get_node::<R>().await.unwrap()
     }
 }
 
-pub struct MemoAnchor<H, T, R>
+pub struct MemoAnchor<S, H, T, R>
 where
-    H: EffectHandler<T, R>,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, R>,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
     pub id: Id,
     handler: H,
-    phantom: PhantomData<(T, R)>,
+    phantom: PhantomData<(S, T, R)>,
 }
 
-impl<H, T, R> MemoAnchor<H, T, R>
+impl<S, H, T, R> MemoAnchor<S, H, T, R>
 where
-    H: EffectHandler<T, R> + Clone,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, R> + Clone,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
     pub fn new(handler: H) -> Self {
@@ -487,9 +505,10 @@ where
     }
 }
 
-impl<H, T, R> Clone for MemoAnchor<H, T, R>
+impl<S, H, T, R> Clone for MemoAnchor<S, H, T, R>
 where
-    H: EffectHandler<T, R> + Clone,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, R> + Clone,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
     fn clone(&self) -> Self {
@@ -502,35 +521,44 @@ where
 }
 
 #[async_trait]
-impl<H, T, R> Reactive for MemoAnchor<H, T, R>
+impl<S, H, T, R> Reactive<S> for MemoAnchor<S, H, T, R>
 where
+    S: Send + Sync + Clone + 'static,
     T: Send + Sync + 'static,
-    H: EffectHandler<T, R> + Clone + 'static,
+    H: EffectHandler<S, T, R> + Clone + 'static,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
-    async fn changed(&self, eve: &Eve) -> bool {
-        let mut context = EffectContext::new(&eve);
+    async fn changed(&self, eve: &Eve<S>) -> bool {
+        let mut context = EffectContext::new(eve);
         let new_value = self.handler.call(&mut context).await;
         if let Some(old_value) = eve.get_node_value::<R>() {
-            new_value == old_value
+            if new_value != old_value {
+                eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(new_value)));
+                true
+            } else {
+                false
+            }
         } else {
+            eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(new_value)));
             true
         }
     }
 }
 
-pub struct EffectAnchor<H, T>
+pub struct EffectAnchor<S, H, T>
 where
-    H: EffectHandler<T, ()>,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, ()>,
 {
     pub id: Id,
     handler: H,
-    phantom: PhantomData<T>,
+    phantom: PhantomData<(S, T)>,
 }
 
-impl<H, T> Clone for EffectAnchor<H, T>
+impl<S, H, T> Clone for EffectAnchor<S, H, T>
 where
-    H: EffectHandler<T, ()> + Clone,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, ()> + Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -541,9 +569,10 @@ where
     }
 }
 
-impl<H, T> EffectAnchor<H, T>
+impl<S, H, T> EffectAnchor<S, H, T>
 where
-    H: EffectHandler<T, ()> + Clone + 'static,
+    S: Send + Sync + Clone + 'static,
+    H: EffectHandler<S, T, ()> + Clone + 'static,
 {
     pub fn new(handler: H) -> Self {
         Self {
@@ -555,12 +584,13 @@ where
 }
 
 #[async_trait]
-impl<H, T> Reactive for EffectAnchor<H, T>
+impl<S, H, T> Reactive<S> for EffectAnchor<S, H, T>
 where
+    S: Send + Sync + Clone + 'static,
     T: Send + Sync + 'static,
-    H: EffectHandler<T, ()> + Clone + 'static,
+    H: EffectHandler<S, T, ()> + Clone + 'static,
 {
-    async fn changed(&self, eve: &Eve) -> bool {
+    async fn changed(&self, eve: &Eve<S>) -> bool {
         let mut context = EffectContext::new(&eve);
         self.handler.call(&mut context).await;
         true
@@ -576,9 +606,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_signal() {
-        let mut eve_builder = EveBuilder::new();
+        let mut eve_builder = EveBuilder::new(());
 
-        let eve = eve_builder.add_signal(|| 7_i32).build().unwrap();
+        let eve = eve_builder.reg_signal(|| 7_i32).build().unwrap();
         let signal = eve.get_signal::<i32>().unwrap();
         dbg!(signal.get().await);
         println!("3");
@@ -590,14 +620,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_memo() {
-        // let eve = Eve::new();
-        //
-        // async fn memo(eve: Eve) -> i32 {
-        //     println!("memo");
-        //     0
-        // }
-        //
-        // eve.add_memo(memo).unwrap();
+        async fn memo_fn(eve: Eve<()>) -> i32 {
+            println!("memo");
+            0
+        }
+        let eve = EveBuilder::new(()).reg_memo(memo_fn).build().unwrap();
+        let memo = eve.get_memo::<i32>().unwrap();
+        dbg!(memo.get().await);
     }
 
     #[tokio::test]

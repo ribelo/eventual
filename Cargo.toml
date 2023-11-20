@@ -4,27 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# minions-derive = { path = "../minions-derive" }
-ahash = "0.8"
+eventual-derive = { path = "eventual-derive" }
 async-trait = "0.1"
-hashbrown = "0.14"
 strum = { version = "0.25", features = ["derive"] }
 thiserror = "1.0"
 tokio = { version = "1.32", features = ["full"] }
 tracing = "0.1"
-typed-builder = "0.16"
 chrono = "0.4.31"
-parking_lot = "0.12.1"
-dashmap = "5.5.3"
-smallvec = "1.11.1"
 rayon = "1.8.0"
-num_cpus = "1.16.0"
-pollster = "0.3.0"
-nanoid = "0.4.0"
 dyn-clone = "1.0.16"
 rustc-hash = "1.1.0"
 downcast-rs = "1.2.0"
 arc-swap = "1.6.0"
+async-recursion = "1.0.5"
 
 [dev-dependencies]
 criterion = "0.5"

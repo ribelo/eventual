@@ -12,6 +12,7 @@ pub mod event;
 pub mod event_handler;
 pub mod id;
 pub mod reactive;
+pub use eventual_derive::Event;
 
 pub trait BoxableValue: DowncastSync + DynClone + fmt::Debug {}
 dyn_clone::clone_trait_object!(BoxableValue);

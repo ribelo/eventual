@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::id::Id;
+use crate::{event::Message, id::Id};
 
 #[derive(Debug, Error, Clone, Copy)]
 #[error("Node not found {id}")]
@@ -63,4 +63,12 @@ impl From<GetNodeValueError> for SetNodeValueError {
             GetNodeValueError::ReactivelyChannel(e) => Self::ReactivelyChannel(e),
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum DispatchError {
+    #[error(transparent)]
+    SendError(#[from] tokio::sync::mpsc::error::SendError<Message>),
+    #[error(transparent)]
+    RecvError(#[from] tokio::sync::oneshot::error::RecvError),
 }
