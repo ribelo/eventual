@@ -1,18 +1,11 @@
-use arc_swap::ArcSwap;
-use downcast_rs::DowncastSync;
-use dyn_clone::DynClone;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
-    any::{type_name, Any},
-    borrow::BorrowMut,
-    cell::RefCell,
     marker::PhantomData,
     mem,
-    rc::Rc,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 use tokio::sync::{
-    mpsc::{self, error::SendError},
+    mpsc::{self},
     oneshot,
 };
 use tracing::error;
@@ -23,7 +16,6 @@ use crate::{
     event_handler::{EventContext, EventHandler, EventHandlerFn, EventHandlerWrapper},
     id::Id,
     reactive::{NodeState, NodeValue, Reactive},
-    BoxableValue,
 };
 
 #[derive(Clone, Debug)]
@@ -227,11 +219,11 @@ mod tests {
         }
         impl Eventable for Ping {}
 
-        async fn ping_handler_a(event: Ping, eve: Eve<()>) {
+        async fn ping_handler_a(event: Ping, _eve: Eve<()>) {
             println!("ping a {:?}", event.i);
         }
 
-        async fn ping_handler_b(event: Ping, eve: Eve<()>) {
+        async fn ping_handler_b(event: Ping, _eve: Eve<()>) {
             println!("ping b {:?}", event.i);
         }
 
@@ -242,7 +234,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        eve.dispatch(Ping { i: 10 }).await;
+        eve.dispatch(Ping { i: 10 }).await.unwrap();
         println!("dispatched");
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

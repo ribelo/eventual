@@ -1,24 +1,11 @@
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    fmt,
-    marker::PhantomData,
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
+use std::{borrow::Cow, collections::BTreeMap, fmt, marker::PhantomData, ops::Deref, sync::Arc};
 
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use rustc_hash::FxHashSet as HashSet;
-use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    effect_handler::{EffectContext, EffectHandler, EffectHandlerFn},
-    error::{
-        DowncastError, GetNodeValueError, NodeNotFoundError, ReactivelyChannelError,
-        ReplyChannelError, SetNodeValueError,
-    },
+    effect_handler::{EffectContext, EffectHandler},
     eve::{Eve, EveBuilder},
     id::Id,
     BoxableValue,
@@ -207,10 +194,6 @@ where
             .unwrap()
             .get(&id)
             .and_then(|value| value.get::<T>())
-    }
-
-    pub(crate) fn get_node_boxed_value(&self, id: Id) -> Option<NodeValue> {
-        self.values.lock().unwrap().get(&id).cloned()
     }
 
     pub async fn set_node_value<T>(&self, value: T)
@@ -680,12 +663,11 @@ where
 mod tests {
     use crate::{
         eve::{Eve, EveBuilder},
-        id::Id,
         reactive::Node,
     };
 
     #[tokio::test]
-    async fn test_trigger() {
+    async fn trigger_test() {
         let eve_builder = EveBuilder::new(());
 
         #[derive(Clone, Copy, Debug, Default)]
@@ -705,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_signal() {
+    async fn signal_test() {
         let eve_builder = EveBuilder::new(());
 
         let eve = eve_builder.reg_signal(|| 7_i32).build().unwrap();
@@ -716,8 +698,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memo() {
-        async fn memo_fn(eve: Eve<()>) -> i32 {
+    async fn memo_test() {
+        async fn memo_fn(_eve: Eve<()>) -> i32 {
             0
         }
         let eve = EveBuilder::new(()).reg_memo(memo_fn).build().unwrap();
@@ -736,7 +718,7 @@ mod tests {
     // }
 
     #[tokio::test]
-    async fn test_diamond() {
+    async fn diamond_test() {
         #[derive(Debug, Clone, PartialEq)]
         pub struct NodeA(i32);
         #[derive(Debug, Clone, PartialEq)]
@@ -836,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrency() {
+    async fn concurrency_test() {
         #[derive(Debug, Clone, PartialEq)]
         pub struct NodeA;
         #[derive(Debug, Clone, PartialEq)]

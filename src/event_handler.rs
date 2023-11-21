@@ -1,10 +1,9 @@
-use rustc_hash::FxHashSet as HashSet;
-use std::{fmt, future::Future, marker::PhantomData, ops::Deref, sync::Arc};
+use std::{fmt, future::Future, marker::PhantomData, ops::Deref};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 
-use crate::{eve::Eve, event::Eventable, id::Id, reactive::Node, BoxableValue};
+use crate::{eve::Eve, event::Eventable, reactive::Node, BoxableValue};
 
 #[derive(Clone)]
 pub struct EventContext<'a, S>
@@ -175,64 +174,5 @@ where
     async fn from_context(context: &EventContext<S>) -> Self {
         println!("type: {:?}", std::any::type_name::<T>());
         Node(context.eve.get_node::<T>().await.unwrap())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_fn() {
-        pub struct Param(pub String);
-
-        pub struct Uid(pub u32);
-
-        #[async_trait]
-        impl FromEventContext<()> for Param {
-            async fn from_context(_context: &EventContext<()>) -> Self {
-                Param("foo".to_string())
-            }
-        }
-
-        #[async_trait]
-        impl FromEventContext<()> for Uid {
-            async fn from_context(_context: &EventContext<()>) -> Self {
-                Uid(7)
-            }
-        }
-        async fn print_id(id: Uid) {
-            println!("id is {}", id.0);
-        }
-        async fn print_param(Param(param): Param) {
-            println!("param is {param}");
-        }
-
-        async fn print_all(Param(param): Param, Uid(id): Uid) {
-            println!("param is {param}, id is {id}");
-        }
-
-        async fn print_all_switched(Uid(id): Uid, Param(param): Param) {
-            println!("param is {param}, id is {id}");
-        }
-
-        #[derive(Debug, Clone)]
-        struct Ping;
-        impl Eventable for Ping {}
-
-        // let eve = Eve::new();
-        // let context = EventContext::new(Box::new(Ping), eve);
-        //
-        // pub(crate) async fn trigger<T, H>(context: &EventContext, handler: H)
-        // where
-        //     H: EventHandler<T>,
-        // {
-        //     handler.call(context).await;
-        // }
-        //
-        // trigger(&context, print_id).await;
-        // trigger(&context, print_param).await;
-        // trigger(&context, print_all).await;
-        // trigger(&context, print_all_switched).await;
     }
 }

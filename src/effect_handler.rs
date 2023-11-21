@@ -1,4 +1,4 @@
-use std::{any::Any, fmt, future::Future, marker::PhantomData, sync::Arc};
+use std::{fmt, future::Future, marker::PhantomData};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -182,45 +182,5 @@ where
 
     fn collect_dependencies(deps: &mut HashSet<Id>) {
         deps.insert(Id::new::<T>());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn effect_handler_fn() {
-        pub struct Param(pub String);
-
-        pub struct Uid(pub u32);
-
-        #[async_trait]
-        impl FromEffectContext<()> for Param {
-            async fn from_context(_context: &mut EffectContext<()>) -> Self {
-                Param("foo".to_string())
-            }
-        }
-
-        #[async_trait]
-        impl FromEffectContext<()> for Uid {
-            async fn from_context(_context: &mut EffectContext<()>) -> Self {
-                Uid(7)
-            }
-        }
-        async fn return_i32(_id: Uid) -> i32 {
-            12
-        }
-        // let eve = Eve::new();
-        // let context = EffectContext::new(&eve);
-        //
-        // pub(crate) async fn trigger<T, H, R>(mut context: EffectContext<'_>, handler: H) -> R
-        // where
-        //     H: EffectHandler<T, R>,
-        // {
-        //     handler.call(&mut context).await
-        // }
-        //
-        // dbg!(trigger(context, return_i32).await);
     }
 }
