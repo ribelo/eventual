@@ -41,7 +41,7 @@ where
     pub(crate) sources: Arc<HashMap<Id, Arc<HashSet<Id>>>>,
     pub(crate) subscribers: Arc<HashMap<Id, Arc<HashSet<Id>>>>,
     pub(crate) reactive: Arc<HashMap<Id, Arc<dyn Reactive<S>>>>,
-    pub(crate) values: Arc<HashMap<Id, Arc<Mutex<NodeValue>>>>,
+    pub(crate) values: Arc<Mutex<HashMap<Id, NodeValue>>>,
     pub(crate) effects: Arc<HashSet<Id>>,
 }
 
@@ -116,17 +116,12 @@ where
             subscribers: Arc::new(
                 self.subscribers
                     .drain()
-                    .map(|(k, v)| (k, Arc::new(v))) // Clone the HashSet and wrap it in Arc
+                    .map(|(k, v)| (k, Arc::new(v)))
                     .collect(),
             ),
-            reactive: Arc::new(mem::take(&mut self.reactive.clone())), // Clone before taking
-            values: Arc::new(
-                self.values
-                    .drain()
-                    .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
-                    .collect(),
-            ),
-            effects: Arc::new(mem::take(&mut self.effects.clone())), // Clone before taking
+            reactive: Arc::new(mem::take(&mut self.reactive)), // Clone before taking
+            values: Arc::new(Mutex::new(mem::take(&mut self.values))),
+            effects: Arc::new(mem::take(&mut self.effects)), // Clone before taking
         };
 
         run_events_loop(
@@ -229,7 +224,7 @@ mod tests {
         #[derive(Debug, Clone)]
         struct Ping {
             i: i32,
-        };
+        }
         impl Eventable for Ping {}
 
         async fn ping_handler_a(event: Ping, eve: Eve<()>) {

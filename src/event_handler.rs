@@ -1,5 +1,5 @@
 use rustc_hash::FxHashSet as HashSet;
-use std::{fmt, future::Future, marker::PhantomData, ops::Deref};
+use std::{fmt, future::Future, marker::PhantomData, ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;

@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     marker::PhantomData,
+    ops::Deref,
     sync::{Arc, Mutex},
 };
 
@@ -38,7 +39,7 @@ where
     T: BoxableValue + Clone + 'static,
 {
     fn into_node_value(self) -> NodeValue {
-        NodeValue::Memoized(Box::new(self))
+        NodeValue::Memoized(Arc::new(self))
     }
 }
 
@@ -46,7 +47,7 @@ where
 pub enum NodeValue {
     Uninitialized,
     Void,
-    Memoized(Box<dyn BoxableValue>),
+    Memoized(Arc<dyn BoxableValue>),
 }
 
 impl NodeValue {
@@ -54,20 +55,30 @@ impl NodeValue {
     where
         T: BoxableValue,
     {
-        Self::Memoized(Box::new(value))
+        Self::Memoized(Arc::new(value))
     }
-    pub fn get<T>(&self) -> Option<T>
+    pub fn get<T>(&self) -> Option<Arc<T>>
     where
         T: BoxableValue + Clone,
     {
         match self {
             NodeValue::Uninitialized | NodeValue::Void => None,
-            NodeValue::Memoized(value) => value.downcast_ref::<T>().cloned(),
+            NodeValue::Memoized(value) => value.clone().downcast_arc::<T>().ok(),
         }
     }
 }
 
-pub struct Node<T: BoxableValue + Clone + 'static>(pub T);
+pub struct Node<T: BoxableValue + Clone + 'static>(pub Arc<T>);
+
+impl<T> Deref for Node<T>
+where
+    T: BoxableValue + Clone + 'static,
+{
+    type Target = Arc<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<S> EveBuilder<S>
 where
@@ -106,7 +117,7 @@ where
         self.reg_reactive(
             id,
             Default::default(),
-            NodeValue::Memoized(Box::<T>::default()),
+            NodeValue::Memoized(Arc::<T>::default()),
             Arc::new(anchor),
         );
 
@@ -177,7 +188,7 @@ where
         }
     }
 
-    pub async fn get_node<T>(&self) -> Option<T>
+    pub async fn get_node<T>(&self) -> Option<Arc<T>>
     where
         T: BoxableValue + Clone,
     {
@@ -186,18 +197,20 @@ where
         self.get_node_value::<T>()
     }
 
-    pub(crate) fn get_node_value<T>(&self) -> Option<T>
+    pub(crate) fn get_node_value<T>(&self) -> Option<Arc<T>>
     where
         T: BoxableValue + Clone,
     {
         let id = Id::new::<T>();
         self.values
+            .lock()
+            .unwrap()
             .get(&id)
-            .and_then(|value| value.lock().unwrap().get::<T>())
+            .and_then(|value| value.get::<T>())
     }
 
-    pub(crate) fn get_node_boxed_value(&self, id: Id) -> Option<Arc<Mutex<NodeValue>>> {
-        self.values.get(&id).cloned()
+    pub(crate) fn get_node_boxed_value(&self, id: Id) -> Option<NodeValue> {
+        self.values.lock().unwrap().get(&id).cloned()
     }
 
     pub async fn set_node_value<T>(&self, value: T)
@@ -205,14 +218,12 @@ where
         T: BoxableValue + Clone,
     {
         let id = Id::new::<T>();
-        self.set_node_value_by_id(id, NodeValue::Memoized(Box::new(value)));
+        self.set_node_value_by_id(id, NodeValue::new(value));
         self.mark_subs_as_dirty(id).await;
     }
 
     pub(crate) fn set_node_value_by_id(&self, id: Id, value: NodeValue) {
-        if let Some(node_value) = self.get_node_boxed_value(id) {
-            *node_value.lock().unwrap() = value;
-        }
+        self.values.lock().unwrap().insert(id, value);
     }
 
     fn get_reactive(&self, id: Id) -> Option<Arc<dyn Reactive<S>>> {
@@ -415,13 +426,13 @@ where
         }
     }
 
-    pub async fn get(&self) -> R {
+    pub async fn get(&self) -> Arc<R> {
         self.eve.get_node::<R>().await.unwrap()
     }
 
     pub async fn set(&self, value: R) {
         let old_value = self.get().await;
-        if value != old_value {
+        if value != *old_value {
             self.eve
                 .set_node_value_by_id(self.id, NodeValue::new(value));
             self.eve.mark_subs_as_dirty(self.id).await;
@@ -489,7 +500,7 @@ where
 {
     async fn run(&self, eve: &Eve<S>) {
         let value = (self.handler)();
-        eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(value)));
+        eve.set_node_value_by_id(self.id, NodeValue::new(value));
         eve.set_node_state(self.id, NodeState::Clean);
     }
 }
@@ -518,7 +529,7 @@ where
         }
     }
 
-    pub async fn get(&self) -> R {
+    pub async fn get(&self) -> Arc<R> {
         self.eve.get_node::<R>().await.unwrap()
     }
 }
@@ -579,9 +590,9 @@ where
         // Update the node value if it's different from the existing one
         if eve
             .get_node_value::<R>()
-            .map_or(true, |old_value| new_value != old_value)
+            .map_or(true, |old_value| new_value != *old_value)
         {
-            eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(new_value)));
+            eve.set_node_value_by_id(self.id, NodeValue::new(new_value));
         }
 
         // Mark node as clean in either case
@@ -699,9 +710,9 @@ mod tests {
 
         let eve = eve_builder.reg_signal(|| 7_i32).build().unwrap();
         let signal = eve.get_signal::<i32>().unwrap();
-        assert_eq!(signal.get().await, 7_i32);
+        assert_eq!(*signal.get().await, 7_i32);
         signal.set(8).await;
-        assert_eq!(signal.get().await, 8_i32);
+        assert_eq!(*signal.get().await, 8_i32);
     }
 
     #[tokio::test]
@@ -711,7 +722,7 @@ mod tests {
         }
         let eve = EveBuilder::new(()).reg_memo(memo_fn).build().unwrap();
         let memo = eve.get_memo::<i32>().unwrap();
-        assert_eq!(memo.get().await, 0);
+        assert_eq!(*memo.get().await, 0);
     }
 
     // #[tokio::test]
@@ -779,7 +790,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            eve.get_node::<NodeH>().await.unwrap(),
+            *eve.get_node::<NodeH>().await.unwrap(),
             NodeH(8),
             "Initial NodeH value should be 8"
         );
@@ -788,37 +799,37 @@ mod tests {
         eve.set_node_value(NodeA(2)).await;
 
         assert_eq!(
-            eve.get_node::<NodeB>().await.unwrap(),
+            *eve.get_node::<NodeB>().await.unwrap(),
             NodeB(3),
             "NodeB value should be 3"
         );
         assert_eq!(
-            eve.get_node::<NodeC>().await.unwrap(),
+            *eve.get_node::<NodeC>().await.unwrap(),
             NodeC(3),
             "NodeC value should be 3"
         );
         assert_eq!(
-            eve.get_node::<NodeD>().await.unwrap(),
+            *eve.get_node::<NodeD>().await.unwrap(),
             NodeD(4),
             "NodeD value should be 4"
         );
         assert_eq!(
-            eve.get_node::<NodeE>().await.unwrap(),
+            *eve.get_node::<NodeE>().await.unwrap(),
             NodeE(4),
             "NodeE value should be 4"
         );
         assert_eq!(
-            eve.get_node::<NodeF>().await.unwrap(),
+            *eve.get_node::<NodeF>().await.unwrap(),
             NodeF(4),
             "NodeF value should be 4"
         );
         assert_eq!(
-            eve.get_node::<NodeG>().await.unwrap(),
+            *eve.get_node::<NodeG>().await.unwrap(),
             NodeG(4),
             "NodeG value should be 4"
         );
         assert_eq!(
-            eve.get_node::<NodeH>().await.unwrap(),
+            *eve.get_node::<NodeH>().await.unwrap(),
             NodeH(16),
             "NodeH value should be 16"
         );
