@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, marker::PhantomData};
+use std::{any::Any, fmt, future::Future, marker::PhantomData};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -23,11 +23,12 @@ where
     }
 }
 
+#[async_trait]
 pub trait FromEffectContext<S>: Send + Sync + 'static
 where
     S: Send + Sync + Clone + 'static,
 {
-    fn from_context(context: &mut EffectContext<S>) -> Self;
+    async fn from_context(context: &mut EffectContext<S>) -> Self;
     fn collect_dependencies(_deps: &mut HashSet<Id>) {}
 }
 
@@ -66,7 +67,7 @@ macro_rules! tuple_impls {
             Fut: Future<Output = R> + Send,
         {
             async fn call(&self, context: &mut EffectContext<S>) -> R {
-                (self)($(<$t>::from_context(context),)*).await
+                (self)($(<$t>::from_context(context).await,)*).await
             }
             fn collect_dependencies(&self, deps: &mut HashSet<Id>) {
                 $(
@@ -160,21 +161,23 @@ where
     }
 }
 
+#[async_trait]
 impl<S> FromEffectContext<S> for Eve<S>
 where
     S: Send + Sync + Clone + 'static,
 {
-    fn from_context(context: &mut EffectContext<S>) -> Self {
+    async fn from_context(context: &mut EffectContext<S>) -> Self {
         context.eve.clone()
     }
 }
 
+#[async_trait]
 impl<S, T: BoxableValue + Clone> FromEffectContext<S> for Node<T>
 where
     S: Send + Sync + Clone + 'static,
 {
-    fn from_context(context: &mut EffectContext<S>) -> Self {
-        Node(context.eve.get_node_value::<T>().unwrap())
+    async fn from_context(context: &mut EffectContext<S>) -> Self {
+        Node(context.eve.get_node::<T>().await.unwrap())
     }
 
     fn collect_dependencies(deps: &mut HashSet<Id>) {
@@ -192,14 +195,16 @@ mod tests {
 
         pub struct Uid(pub u32);
 
+        #[async_trait]
         impl FromEffectContext<()> for Param {
-            fn from_context(_context: &mut EffectContext<()>) -> Self {
+            async fn from_context(_context: &mut EffectContext<()>) -> Self {
                 Param("foo".to_string())
             }
         }
 
+        #[async_trait]
         impl FromEffectContext<()> for Uid {
-            fn from_context(_context: &mut EffectContext<()>) -> Self {
+            async fn from_context(_context: &mut EffectContext<()>) -> Self {
                 Uid(7)
             }
         }

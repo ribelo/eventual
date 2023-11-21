@@ -90,7 +90,7 @@ where
     pub fn build(&mut self) -> Result<Eve<S>, RunEveError> {
         for deps in self.sources.values() {
             for dep_id in deps.iter() {
-                if self.sources.contains_key(dep_id) {
+                if !self.statuses.contains_key(dep_id) {
                     return Err(NodeNotFoundError { id: *dep_id }.into());
                 }
             }

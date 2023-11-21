@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use async_recursion::async_recursion;
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 use rustc_hash::FxHashSet as HashSet;
@@ -25,7 +26,6 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
     Clean,
-    Check,
     Dirty,
 }
 
@@ -97,6 +97,22 @@ where
         self.reactive.insert(id, reactive);
     }
 
+    pub fn reg_trigger<T>(mut self) -> Self
+    where
+        T: BoxableValue + Clone + Default + 'static,
+    {
+        let id = Id::new::<T>();
+        let anchor: TriggerAnchor = TriggerAnchor::new::<T>();
+        self.reg_reactive(
+            id,
+            Default::default(),
+            NodeValue::Memoized(Box::<T>::default()),
+            Arc::new(anchor),
+        );
+
+        self
+    }
+
     pub fn reg_signal<F, R>(mut self, factory: F) -> Self
     where
         F: Fn() -> R + Send + Sync + Clone + 'static,
@@ -139,7 +155,6 @@ where
         handler.collect_dependencies(&mut sources);
 
         let id = Id::new::<H>();
-        println!("effect id: {:?} {}", id, id);
         let anchor: EffectAnchor<S, H, T> = EffectAnchor::new(handler);
         self.reg_reactive(id, sources, NodeValue::Void, Arc::new(anchor));
         self.effects.insert(id);
@@ -155,11 +170,13 @@ where
     fn get_node_state(&self, id: Id) -> Option<NodeState> {
         self.statuses.get(&id).map(|state| *state.lock().unwrap())
     }
+
     fn set_node_state(&self, id: Id, state: NodeState) {
         if let Some(old_value) = self.statuses.get(&id) {
             *old_value.lock().unwrap() = state;
         }
     }
+
     pub async fn get_node<T>(&self) -> Option<T>
     where
         T: BoxableValue + Clone,
@@ -167,11 +184,6 @@ where
         let id = Id::new::<T>();
         self.update_node_if_necessary(id).await;
         self.get_node_value::<T>()
-    }
-
-    pub(crate) async fn get_node_by_id(&self, id: Id) -> Option<Arc<Mutex<NodeValue>>> {
-        self.update_node_if_necessary(id).await;
-        self.get_node_boxed_value(id)
     }
 
     pub(crate) fn get_node_value<T>(&self) -> Option<T>
@@ -186,6 +198,15 @@ where
 
     pub(crate) fn get_node_boxed_value(&self, id: Id) -> Option<Arc<Mutex<NodeValue>>> {
         self.values.get(&id).cloned()
+    }
+
+    pub async fn set_node_value<T>(&self, value: T)
+    where
+        T: BoxableValue + Clone,
+    {
+        let id = Id::new::<T>();
+        self.set_node_value_by_id(id, NodeValue::Memoized(Box::new(value)));
+        self.mark_subs_as_dirty(id).await;
     }
 
     pub(crate) fn set_node_value_by_id(&self, id: Id, value: NodeValue) {
@@ -206,24 +227,10 @@ where
         self.subscribers.get(&id).cloned()
     }
 
-    async fn update_node(&self, id: Id) {
-        if let Some(node) = self.get_reactive(id) {
-            if node.changed(self).await {
-                if let Some(subs) = self.get_node_subscribers(id) {
-                    for sub_id in subs.iter() {
-                        self.set_node_state(*sub_id, NodeState::Dirty);
-                    }
-                }
-            }
-            self.set_node_state(id, NodeState::Clean);
-        }
-    }
-
     async fn update_node_if_necessary(&self, root_id: Id) {
         let state = self.get_node_state(root_id);
-        match state {
-            None | Some(NodeState::Clean) => return,
-            _ => {}
+        if matches!(state, None | Some(NodeState::Clean)) {
+            return;
         }
 
         let mut levels: BTreeMap<usize, HashSet<Id>> = BTreeMap::default();
@@ -234,49 +241,45 @@ where
             if let Some(sources) = self.get_node_sources(id) {
                 let next_level = level + 1;
                 for &source_id in sources.iter() {
-                    queue.push((next_level, source_id));
+                    if self.get_node_state(source_id) == Some(NodeState::Dirty) {
+                        queue.push((next_level, source_id));
+                    }
                 }
             }
         }
 
         while let Some((_, ids)) = levels.pop_last() {
-            // let mut tasks = Vec::new();
+            let mut set = tokio::task::JoinSet::new();
             for id in ids {
-                self.update_node(id).await;
-                // let cloned_self = self.clone();
-
-                // TODO:
-
-                // let task = self
-                //     .executor
-                //     .spawn(async move { cloned_self.update_node(id).await });
-                // tasks.push(task);
+                if let Some(node) = self.get_reactive(id) {
+                    let cloned_self = self.clone();
+                    set.spawn(async move {
+                        node.run(&cloned_self).await;
+                    });
+                }
             }
-            // for task in tasks {
-            //     task.await.unwrap();
-            // }
+            while (set.join_next().await).is_some() {}
         }
     }
 
-    fn mark_node_as_check(&self, id: Id) {
-        self.set_node_state(id, NodeState::Check);
+    pub(crate) async fn mark_subs_as_dirty(&self, root_id: Id) {
+        let mut stack = Vec::new();
 
-        if let Some(subs) = self.get_node_subscribers(id) {
-            for sub_id in subs.iter() {
-                self.mark_node_as_check(*sub_id);
+        if let Some(subs) = self.get_node_subscribers(root_id) {
+            for &sub_id in subs.iter() {
+                stack.push(sub_id);
             }
         }
-    }
 
-    pub(crate) async fn mark_node_as_dirty(&self, id: Id) {
-        self.set_node_state(id, NodeState::Dirty);
+        while let Some(id) = stack.pop() {
+            self.set_node_state(id, NodeState::Dirty);
 
-        if let Some(subs) = self.get_node_subscribers(id) {
-            for sub_id in subs.iter() {
-                self.mark_node_as_check(*sub_id);
+            if let Some(subs) = self.get_node_subscribers(id) {
+                for &sub_id in subs.iter() {
+                    stack.push(sub_id);
+                }
             }
         }
-        self.fire_pending_effects().await;
     }
 
     async fn fire_pending_effects(&self) {
@@ -285,6 +288,18 @@ where
             if let Some(NodeState::Dirty) = self.get_node_state(*effect_id) {
                 self.update_node_if_necessary(*effect_id).await;
             }
+        }
+    }
+
+    pub fn get_trigger<T>(&self) -> Option<Trigger<S, T>>
+    where
+        T: Send + Sync + Clone + 'static,
+    {
+        let id = Id::new::<T>();
+        if self.statuses.contains_key(&id) {
+            Some(Trigger::new(self.clone()))
+        } else {
+            None
         }
     }
 
@@ -313,15 +328,12 @@ where
     }
 }
 
-pub trait Observable: Send + Sync + Clone + fmt::Debug + 'static {}
-impl<T: Send + Sync + Clone + fmt::Debug + 'static> Observable for T {}
-
 #[async_trait]
 pub trait Reactive<S>: DynClone + Send + Sync + 'static
 where
     S: Send + Sync,
 {
-    async fn changed(&self, eve: &Eve<S>) -> bool;
+    async fn run(&self, eve: &Eve<S>);
 }
 dyn_clone::clone_trait_object!(<S> Reactive<S>);
 
@@ -337,15 +349,46 @@ pub struct TriggerAnchor {
 }
 
 impl TriggerAnchor {
-    pub fn new<T: Observable>() -> Self {
+    pub fn new<T: Send + Sync + 'static>() -> Self {
         Self { id: Id::new::<T>() }
     }
 }
 
+pub struct Trigger<S, T>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    pub id: Id,
+    phantom: PhantomData<T>,
+    eve: Eve<S>,
+}
+
+impl<S, T> Trigger<S, T>
+where
+    S: Send + Sync + Clone + 'static,
+    T: Send + Sync + Clone + 'static,
+{
+    pub fn new(eve: Eve<S>) -> Self {
+        Self {
+            id: Id::new::<T>(),
+            phantom: PhantomData,
+            eve,
+        }
+    }
+
+    pub async fn fire(&self) {
+        self.eve.mark_subs_as_dirty(self.id).await;
+        self.eve.fire_pending_effects().await;
+    }
+}
+
 #[async_trait]
-impl<S: Send + Sync> Reactive<S> for TriggerAnchor {
-    async fn changed(&self, _eve: &Eve<S>) -> bool {
-        true
+impl<S> Reactive<S> for TriggerAnchor
+where
+    S: Send + Sync + Clone + 'static,
+{
+    async fn run(&self, eve: &Eve<S>) {
+        eve.set_node_state(self.id, NodeState::Clean);
     }
 }
 
@@ -371,17 +414,21 @@ where
             eve,
         }
     }
+
     pub async fn get(&self) -> R {
         self.eve.get_node::<R>().await.unwrap()
     }
+
     pub async fn set(&self, value: R) {
         let old_value = self.get().await;
         if value != old_value {
             self.eve
-                .set_node_value_by_id(self.id, value.into_node_value());
-            self.eve.mark_node_as_dirty(self.id).await;
+                .set_node_value_by_id(self.id, NodeValue::new(value));
+            self.eve.mark_subs_as_dirty(self.id).await;
+            self.eve.fire_pending_effects().await;
         }
     }
+
     pub async fn update<U>(&self, f: U)
     where
         U: FnOnce(&R) -> Cow<'static, R> + Send + Sync + 'static,
@@ -440,14 +487,10 @@ where
     F: Fn() -> R + Send + Sync + Clone + 'static,
     R: BoxableValue + Clone + 'static,
 {
-    async fn changed(&self, eve: &Eve<S>) -> bool {
-        let node_value = eve.get_node_boxed_value(self.id).expect("node not found");
-        let mut guard = node_value.lock().unwrap();
-        if let NodeValue::Uninitialized = *guard {
-            let value = (self.handler)();
-            *guard = value.into_node_value();
-        }
-        true
+    async fn run(&self, eve: &Eve<S>) {
+        let value = (self.handler)();
+        eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(value)));
+        eve.set_node_state(self.id, NodeState::Clean);
     }
 }
 
@@ -474,6 +517,7 @@ where
             eve,
         }
     }
+
     pub async fn get(&self) -> R {
         self.eve.get_node::<R>().await.unwrap()
     }
@@ -528,20 +572,45 @@ where
     H: EffectHandler<S, T, R> + Clone + 'static,
     R: BoxableValue + Clone + PartialEq + 'static,
 {
-    async fn changed(&self, eve: &Eve<S>) -> bool {
+    async fn run(&self, eve: &Eve<S>) {
         let mut context = EffectContext::new(eve);
         let new_value = self.handler.call(&mut context).await;
-        if let Some(old_value) = eve.get_node_value::<R>() {
-            if new_value != old_value {
-                eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(new_value)));
-                true
-            } else {
-                false
-            }
-        } else {
+
+        // Update the node value if it's different from the existing one
+        if eve
+            .get_node_value::<R>()
+            .map_or(true, |old_value| new_value != old_value)
+        {
             eve.set_node_value_by_id(self.id, NodeValue::Memoized(Box::new(new_value)));
-            true
         }
+
+        // Mark node as clean in either case
+        eve.set_node_state(self.id, NodeState::Clean);
+    }
+}
+
+pub struct Effect<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    pub id: Id,
+    eve: Eve<S>,
+}
+
+impl<S> Effect<S>
+where
+    S: Send + Sync + Clone + 'static,
+{
+    pub fn new(eve: Eve<S>) -> Self {
+        Self {
+            id: Id::new::<Self>(),
+            eve,
+        }
+    }
+
+    pub async fn fire(&self) {
+        self.eve.set_node_state(self.id, NodeState::Dirty);
+        self.eve.fire_pending_effects().await;
     }
 }
 
@@ -590,10 +659,9 @@ where
     T: Send + Sync + 'static,
     H: EffectHandler<S, T, ()> + Clone + 'static,
 {
-    async fn changed(&self, eve: &Eve<S>) -> bool {
-        let mut context = EffectContext::new(&eve);
+    async fn run(&self, eve: &Eve<S>) {
+        let mut context = EffectContext::new(eve);
         self.handler.call(&mut context).await;
-        true
     }
 }
 
@@ -602,49 +670,187 @@ mod tests {
     use crate::{
         eve::{Eve, EveBuilder},
         id::Id,
+        reactive::Node,
     };
 
     #[tokio::test]
+    async fn test_trigger() {
+        let eve_builder = EveBuilder::new(());
+
+        #[derive(Clone, Copy, Debug, Default)]
+        struct Trigger;
+
+        async fn effect_fn(_: Node<Trigger>) {
+            println!("effect_fn!");
+        }
+
+        let eve = eve_builder
+            .reg_trigger::<Trigger>()
+            .reg_effect(effect_fn)
+            .build()
+            .unwrap();
+        let trigger = eve.get_trigger::<Trigger>().unwrap();
+        trigger.fire().await;
+    }
+
+    #[tokio::test]
     async fn test_signal() {
-        let mut eve_builder = EveBuilder::new(());
+        let eve_builder = EveBuilder::new(());
 
         let eve = eve_builder.reg_signal(|| 7_i32).build().unwrap();
         let signal = eve.get_signal::<i32>().unwrap();
-        dbg!(signal.get().await);
-        println!("3");
+        assert_eq!(signal.get().await, 7_i32);
         signal.set(8).await;
-        println!("4");
-        dbg!(signal.get().await);
-        dbg!(eve.get_node::<i32>().await.unwrap());
+        assert_eq!(signal.get().await, 8_i32);
     }
 
     #[tokio::test]
     async fn test_memo() {
         async fn memo_fn(eve: Eve<()>) -> i32 {
-            println!("memo");
             0
         }
         let eve = EveBuilder::new(()).reg_memo(memo_fn).build().unwrap();
         let memo = eve.get_memo::<i32>().unwrap();
-        dbg!(memo.get().await);
+        assert_eq!(memo.get().await, 0);
+    }
+
+    // #[tokio::test]
+    // async fn test_effect() {
+    //     async fn effect_fn(eve: Eve<()>) {
+    //         println!("effect_fn")
+    //     }
+    //     let eve = EveBuilder::new(()).reg_effect(effect_fn).build().unwrap();
+    //     let effect = eve.get_effect::<i32>().unwrap();
+    //     assert_eq!(memo.get().await, 0);
+    // }
+
+    #[tokio::test]
+    async fn test_diamond() {
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeA(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeB(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeC(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeD(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeE(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeF(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeG(i32);
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeH(i32);
+
+        let eve = EveBuilder::new(())
+            .reg_signal(|| NodeA(0))
+            .reg_memo(|a: Node<NodeA>| async move {
+                println!("update B a:{}", a.0 .0);
+                NodeB(a.0 .0 + 1)
+            })
+            .reg_memo(|a: Node<NodeA>| async move {
+                println!("update C");
+                NodeC(a.0 .0 + 1)
+            })
+            .reg_memo(|b: Node<NodeB>| async move {
+                println!("update D");
+                NodeD(b.0 .0 + 1)
+            })
+            .reg_memo(|b: Node<NodeB>| async move {
+                println!("update E");
+                NodeE(b.0 .0 + 1)
+            })
+            .reg_memo(|c: Node<NodeC>| async move {
+                println!("update F");
+                NodeF(c.0 .0 + 1)
+            })
+            .reg_memo(|c: Node<NodeC>| async move {
+                println!("update G");
+                NodeG(c.0 .0 + 1)
+            })
+            .reg_memo(
+                |d: Node<NodeD>, e: Node<NodeE>, f: Node<NodeF>, g: Node<NodeG>| async move {
+                    println!("update H");
+                    NodeH(d.0 .0 + e.0 .0 + f.0 .0 + g.0 .0)
+                },
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            eve.get_node::<NodeH>().await.unwrap(),
+            NodeH(8),
+            "Initial NodeH value should be 8"
+        );
+
+        println!("set new value to  A");
+        eve.set_node_value(NodeA(2)).await;
+
+        assert_eq!(
+            eve.get_node::<NodeB>().await.unwrap(),
+            NodeB(3),
+            "NodeB value should be 3"
+        );
+        assert_eq!(
+            eve.get_node::<NodeC>().await.unwrap(),
+            NodeC(3),
+            "NodeC value should be 3"
+        );
+        assert_eq!(
+            eve.get_node::<NodeD>().await.unwrap(),
+            NodeD(4),
+            "NodeD value should be 4"
+        );
+        assert_eq!(
+            eve.get_node::<NodeE>().await.unwrap(),
+            NodeE(4),
+            "NodeE value should be 4"
+        );
+        assert_eq!(
+            eve.get_node::<NodeF>().await.unwrap(),
+            NodeF(4),
+            "NodeF value should be 4"
+        );
+        assert_eq!(
+            eve.get_node::<NodeG>().await.unwrap(),
+            NodeG(4),
+            "NodeG value should be 4"
+        );
+        assert_eq!(
+            eve.get_node::<NodeH>().await.unwrap(),
+            NodeH(16),
+            "NodeH value should be 16"
+        );
     }
 
     #[tokio::test]
-    async fn test_effect() {
-        // let eve = Eve::new();
-        //
-        // async fn test_effect() {
-        //     println!("foo test_effect");
-        // }
-        //
-        // eve.add_effect(test_effect).unwrap();
-        // eve.reg_effect(|eve: Eve| async move {
-        //     println!("test_closure1");
-        // })
-        // .unwrap();
-        // eve.reg_effect(|eve: Eve| async move {
-        //     println!("test_closure2");
-        // })
-        // .unwrap();
+    async fn test_concurrency() {
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeA;
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeB;
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeC;
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct NodeD;
+
+        let start_time = std::time::Instant::now();
+        let eve = EveBuilder::new(())
+            .reg_signal(|| NodeA)
+            .reg_memo(|_: Node<NodeA>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                NodeB
+            })
+            .reg_memo(|_: Node<NodeA>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                NodeC
+            })
+            .reg_memo(|_: Node<NodeB>, _: Node<NodeC>| async move { NodeD })
+            .build()
+            .unwrap();
+        eve.get_node::<NodeD>().await;
+        let duration = start_time.elapsed().as_millis();
+        assert!(900 < duration && duration < 1100);
     }
 }
