@@ -12,10 +12,11 @@ use tracing::error;
 
 use crate::{
     error::{DispatchError, NodeNotFoundError, RunEveError},
-    event::{Eventable, Message},
+    event::{Eventable, IntoMessage, Message},
     event_handler::{EventContext, EventHandler, EventHandlerFn, EventHandlerWrapper},
     id::Id,
     reactive::{NodeState, NodeValue, Reactive},
+    BoxableValue,
 };
 
 #[derive(Clone, Debug)]
@@ -23,7 +24,7 @@ pub struct Eve<S>
 where
     S: Send + Sync,
 {
-    pub state: S,
+    pub app: S,
     pub(crate) message_tx: mpsc::Sender<Message>,
     pub(crate) sync_tx: mpsc::Sender<Message>,
     pub(crate) handlers: Arc<HashMap<Id, Vec<Box<dyn EventHandlerFn<S>>>>>,
@@ -89,7 +90,7 @@ where
         }
 
         let eve = Eve {
-            state: self.state.take().unwrap(),
+            app: self.state.take().unwrap(),
             message_tx: self.message_tx.clone(),
             sync_tx: self.sync_tx.clone(),
             handlers: Arc::new(mem::take(&mut self.handlers.clone())), // Clone before taking
@@ -127,9 +128,9 @@ where
 
     pub fn reg_handler<E, T, H>(mut self, handler: H) -> Result<Self, NodeNotFoundError>
     where
-        E: Eventable + Clone,
+        E: Eventable,
         T: Send + Sync + 'static,
-        H: EventHandler<E, S, T> + Copy + 'static,
+        H: EventHandler<S, T> + Copy + 'static,
     {
         // let mut deps = HashSet::default();
         // handler.collect_dependencies(&mut deps);
@@ -153,14 +154,15 @@ where
         self.handlers.get(&id).cloned()
     }
 
-    pub async fn dispatch<E: Eventable>(&self, event: E) -> Result<(), DispatchError> {
-        self.message_tx.send(Message::new(event)).await?;
+    pub async fn dispatch<I: IntoMessage>(&self, event: I) -> Result<(), DispatchError> {
+        let msg = event.into_message(None);
+        self.message_tx.send(msg).await?;
         Ok(())
     }
 
-    pub async fn dispatch_sync<E: Eventable>(&self, event: E) -> Result<(), DispatchError> {
+    pub async fn dispatch_sync<I: IntoMessage>(&self, event: I) -> Result<(), DispatchError> {
         let (tx, rx) = oneshot::channel();
-        let msg = Message::new_sync(event, tx);
+        let msg = event.into_message(Some(tx));
         self.sync_tx.send(msg).await?;
         rx.await?;
         Ok(())
@@ -174,16 +176,28 @@ fn run_events_loop<S>(
 ) where
     S: Send + Sync + Clone + 'static,
 {
-    let cloned_eve = eve.clone();
+    let outer_eve = eve.clone();
     tokio::spawn(async move {
         loop {
             while let Some(msg) = message_rx.recv().await {
-                if let Some(handlers) = cloned_eve.get_handlers(msg.id) {
-                    let ctx = EventContext::new(msg.event, &cloned_eve);
-                    for handler in handlers {
-                        handler.call_with_context(&ctx).await;
+                let inner_eve = outer_eve.clone();
+                tokio::spawn(async move {
+                    if let Some(handlers) = inner_eve.get_handlers(msg.id) {
+                        let ctx = EventContext::new(msg.event, &inner_eve);
+                        if handlers.is_empty() {
+                            error!("No handlers found for event {:?}", msg.id);
+                        } else {
+                            for handler in handlers {
+                                handler.call_with_context(&ctx).await;
+                            }
+                        }
+                        if let Some(tx) = msg.tx {
+                            tx.send(()).unwrap_or_else(|_| {
+                                error!("Failed to send sync response");
+                            })
+                        }
                     }
-                }
+                });
             }
         }
     });
@@ -192,6 +206,10 @@ fn run_events_loop<S>(
             while let Some(msg) = sync_rx.recv().await {
                 if let Some(handlers) = eve.get_handlers(msg.id) {
                     let ctx = EventContext::new(msg.event, &eve);
+                    if handlers.is_empty() {
+                        error!("No handlers found for event {:?}", msg.id);
+                        continue;
+                    }
                     for handler in handlers {
                         handler.call_with_context(&ctx).await;
                     }
@@ -209,28 +227,29 @@ fn run_events_loop<S>(
 #[cfg(test)]
 mod tests {
 
+    use crate::event::Event;
+
     use super::*;
 
     #[tokio::test]
     async fn event_test() {
-        #[derive(Debug, Clone)]
         struct Ping {
             i: i32,
         }
         impl Eventable for Ping {}
 
-        async fn ping_handler_a(event: Ping, _eve: Eve<()>) {
+        async fn ping_handler_a(event: Event<Ping>, _eve: Eve<()>) {
             println!("ping a {:?}", event.i);
         }
 
-        async fn ping_handler_b(event: Ping, _eve: Eve<()>) {
+        async fn ping_handler_b(event: Event<Ping>, _eve: Eve<()>) {
             println!("ping b {:?}", event.i);
         }
 
         let eve = EveBuilder::new(())
-            .reg_handler(ping_handler_a)
+            .reg_handler::<Ping, _, _>(ping_handler_a)
             .unwrap()
-            .reg_handler(ping_handler_b)
+            .reg_handler::<Ping, _, _>(ping_handler_b)
             .unwrap()
             .build()
             .unwrap();

@@ -55,6 +55,7 @@ impl NodeValue {
     }
 }
 
+#[derive(Debug)]
 pub struct Node<T: BoxableValue + Clone + 'static>(pub Arc<T>);
 
 impl<T> Deref for Node<T>

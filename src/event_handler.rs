@@ -1,16 +1,21 @@
-use std::{fmt, future::Future, marker::PhantomData, ops::Deref};
+use std::{fmt, future::Future, marker::PhantomData, ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 
-use crate::{eve::Eve, event::Eventable, reactive::Node, BoxableValue};
+use crate::{
+    eve::Eve,
+    event::{Event, Eventable},
+    reactive::Node,
+    BoxableValue,
+};
 
 #[derive(Clone)]
 pub struct EventContext<'a, S>
 where
     S: Send + Sync + Clone + 'static,
 {
-    pub(crate) event: Box<dyn Eventable>,
+    pub(crate) event: Arc<dyn Eventable>,
     pub(crate) eve: &'a Eve<S>,
 }
 
@@ -18,7 +23,7 @@ impl<'a, S> EventContext<'a, S>
 where
     S: Send + Sync + Clone + 'static,
 {
-    pub fn new(event: Box<dyn Eventable>, eve: &'a Eve<S>) -> Self {
+    pub fn new(event: Arc<dyn Eventable>, eve: &'a Eve<S>) -> Self {
         EventContext { event, eve }
     }
 }
@@ -32,28 +37,26 @@ where
 }
 
 #[async_trait]
-pub trait EventHandler<E, S, T>: Send + Sync + DynClone
+pub trait EventHandler<S, T>: Send + Sync + DynClone
 where
-    E: Eventable,
     S: Send + Sync + Clone + 'static,
 {
-    async fn call(&self, event: E, context: &EventContext<S>);
+    async fn call(&self, context: &EventContext<S>);
 }
-dyn_clone::clone_trait_object!(<E, S, T> EventHandler<E, S, T>);
+dyn_clone::clone_trait_object!(<S, T> EventHandler< S, T>);
 
 macro_rules! tuple_impls {
     ($($t:ident),*; $f:ident) => {
         #[async_trait]
-        impl<E, S, $($t),*, $f, Fut> EventHandler<E, S, ($($t,)*)> for $f
+        impl<S, $($t),*, $f, Fut> EventHandler< S, ($($t,)*)> for $f
         where
-            E: Eventable,
             S: Send + Sync + Clone + 'static,
-            $f: Fn(E, $($t),*) -> Fut + Send + Sync + Clone,
+            $f: Fn($($t),*) -> Fut + Send + Sync + Clone,
             $($t: FromEventContext<S>,)*
             Fut: Future<Output = ()> + Send,
         {
-            async fn call(&self, event: E, context: &EventContext<S>) {
-                (self)(event, $(<$t>::from_context(&context).await,)*).await;
+            async fn call(&self, context: &EventContext<S>) {
+                (self)($(<$t>::from_context(&context).await,)*).await;
             }
         }
     }
@@ -93,7 +96,7 @@ impl<S> fmt::Debug for dyn EventHandlerFn<S> {
     }
 }
 
-pub(crate) struct EventHandlerWrapper<E, S, H: EventHandler<E, S, T> + Copy, T>
+pub(crate) struct EventHandlerWrapper<E, S, H: EventHandler<S, T> + Copy, T>
 where
     E: Eventable,
     S: Send + Sync + Clone + 'static,
@@ -106,7 +109,7 @@ impl<E, S, H, T> Copy for EventHandlerWrapper<E, S, H, T>
 where
     E: Eventable,
     S: Send + Sync + Clone + 'static,
-    H: EventHandler<E, S, T> + Copy,
+    H: EventHandler<S, T> + Copy,
     T: Send + Sync,
 {
 }
@@ -115,7 +118,7 @@ impl<E, S, H, T> Clone for EventHandlerWrapper<E, S, H, T>
 where
     E: Eventable,
     S: Send + Sync + Clone + 'static,
-    H: EventHandler<E, S, T> + Copy,
+    H: EventHandler<S, T> + Copy,
     T: Send + Sync,
 {
     fn clone(&self) -> Self {
@@ -126,14 +129,13 @@ where
 #[async_trait]
 impl<E, S, H, T> EventHandlerFn<S> for EventHandlerWrapper<E, S, H, T>
 where
-    E: Eventable + Clone,
+    E: Eventable,
     S: Send + Sync + Clone + 'static,
-    H: EventHandler<E, S, T> + Copy,
+    H: EventHandler<S, T> + Copy,
     T: Send + Sync,
 {
     async fn call_with_context(&self, context: &EventContext<S>) {
-        let event = context.event.clone().downcast::<E>().unwrap();
-        self.handler.call(*event, context).await;
+        self.handler.call(context).await;
     }
 }
 
@@ -162,7 +164,7 @@ where
     S: Send + Sync + Clone + 'static,
 {
     async fn from_context(context: &EventContext<S>) -> Self {
-        State(context.eve.state.clone())
+        State(context.eve.app.clone())
     }
 }
 
@@ -172,7 +174,22 @@ where
     S: Send + Sync + Clone + 'static,
 {
     async fn from_context(context: &EventContext<S>) -> Self {
-        println!("type: {:?}", std::any::type_name::<T>());
         Node(context.eve.get_node::<T>().await.unwrap())
+    }
+}
+
+#[async_trait]
+impl<S, T> FromEventContext<S> for Event<T>
+where
+    S: Send + Sync + Clone + 'static,
+    T: Eventable,
+{
+    async fn from_context(context: &EventContext<S>) -> Self {
+        let event = context
+            .event
+            .clone()
+            .downcast_arc::<T>()
+            .unwrap_or_else(|_| panic!("Failed to downcast event"));
+        Event(event)
     }
 }
