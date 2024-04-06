@@ -13,8 +13,7 @@ impl_downcast!(sync Eventable);
 #[async_trait]
 pub trait Respondable: DowncastSync + 'static {
     type Response: BoxableValue;
-    async fn respond(&self);
-    async fn recieve(&self) -> Self::Response;
+    async fn respond(&self, response: Self::Response);
 }
 
 pub struct Message {
